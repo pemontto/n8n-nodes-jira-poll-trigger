@@ -1,0 +1,448 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { JiraTransport, buildPollingJql } = require('../dist/nodes/JiraPollTrigger/transport');
+const { NodeApiError } = require('n8n-workflow');
+const fixtureNode = {
+	id: 'fixture-node',
+	name: 'Jira Poll Trigger',
+	type: 'jiraPollTrigger',
+	typeVersion: 1,
+	position: [0, 0],
+	parameters: {},
+};
+/** n8n rewrites message and httpCode and keeps the axios error under `cause` only. */
+const nodeApiError = (status, headers) =>
+	new NodeApiError(
+		fixtureNode,
+		Object.assign(new Error(`Request failed with status code ${status}`), {
+			isAxiosError: true,
+			code: 'ERR_BAD_REQUEST',
+			response: { status, headers, data: {} },
+		}),
+	);
+const issue = (id) => ({
+	id,
+	key: `TEST-${id}`,
+	fields: { created: '2026-01-01T00:00:00Z', updated: '2026-01-02T00:00:00Z' },
+});
+const comment = (id) => ({
+	id,
+	created: '2020-01-01T00:00:00Z',
+	updated: '2026-01-02T00:00:00Z',
+	body: { type: 'doc' },
+	renderedBody: '<p>Latest</p>',
+	jsdPublic: false,
+});
+async function collect(iterator) {
+	const items = [];
+	for await (const item of iterator) items.push(item);
+	return items;
+}
+
+test('API version rejects unsupported values', () => {
+	for (const apiVersion of [1, 4, '2', 0])
+		assert.throws(() => new JiraTransport(async () => ({}), { apiVersion }), /API version/);
+});
+test('API v2 paginates issues and comments while preserving native wiki markup and metadata', async () => {
+	const calls = [];
+	const transport = new JiraTransport(
+		async (request) => {
+			calls.push(request);
+			if (request.method === 'POST') {
+				const second = request.body.nextPageToken === 'next';
+				return {
+					issues: [
+						{
+							...issue(second ? '2' : '1'),
+							fields: { ...issue('1').fields, description: 'h2. Details\n*bold*' },
+						},
+					],
+					isLast: second,
+					...(second ? {} : { nextPageToken: 'next' }),
+				};
+			}
+			return {
+				comments: [
+					{
+						...comment(String(request.qs.startAt + 1)),
+						body: '*Comment* [link|https://example.org]',
+						author: { accountId: 'author' },
+						updateAuthor: { accountId: 'editor' },
+					},
+				],
+				startAt: request.qs.startAt,
+				maxResults: 100,
+				total: 2,
+			};
+		},
+		{ apiVersion: 2 },
+	);
+	const issues = await collect(transport.searchIssues('project=A', 10, []));
+	const comments = await collect(transport.comments('A/B'));
+	assert.equal(issues.length, 2);
+	assert.equal(comments.length, 2);
+	for (const item of issues) assert.equal(item.fields.description, 'h2. Details\n*bold*');
+	for (const item of comments) {
+		assert.equal(item.body, '*Comment* [link|https://example.org]');
+		assert.equal(item.author.accountId, 'author');
+		assert.equal(item.updateAuthor.accountId, 'editor');
+		assert.equal(item.jsdPublic, false);
+	}
+	for (const request of calls.slice(0, 2)) {
+		assert.equal(request.path, '/rest/api/2/search/jql');
+		assert.equal(request.body.expand, 'renderedFields');
+		assert.equal(request.body.jql, '(project=A) AND updated >= 10 ORDER BY id ASC');
+	}
+	for (const request of calls.slice(2)) {
+		assert.equal(request.path, '/rest/api/2/issue/A%2FB/comment');
+		assert.equal(request.qs.expand, 'renderedBody');
+		assert.equal(request.qs.orderBy, 'created');
+	}
+});
+
+test('JQL groups OR predicates and uses epoch lower boundary without an upper constraint', () => {
+	assert.equal(
+		buildPollingJql('project=A OR project=B', 1234),
+		'(project=A OR project=B) AND updated >= 1234 ORDER BY id ASC',
+	);
+	assert.equal(buildPollingJql('  ', 0), 'updated >= 0 ORDER BY id ASC');
+});
+test('JQL sorts ascending by default and descending on request', async () => {
+	assert.equal(buildPollingJql('project=A', 1), '(project=A) AND updated >= 1 ORDER BY id ASC');
+	assert.equal(
+		buildPollingJql('project=A', 1, 'DESC'),
+		'(project=A) AND updated >= 1 ORDER BY id DESC',
+	);
+	const requests = [];
+	const transport = new JiraTransport(async (request) => {
+		requests.push(request);
+		return { issues: [], isLast: true };
+	});
+	await collect(transport.searchIssues('project=A', 10, []));
+	await collect(transport.searchIssues('project=A', 10, [], { direction: 'DESC' }));
+	assert.deepEqual(
+		requests.map((request) => request.body.jql),
+		[
+			'(project=A) AND updated >= 10 ORDER BY id ASC',
+			'(project=A) AND updated >= 10 ORDER BY id DESC',
+		],
+	);
+});
+test('JQL distinguishes top-level ORDER BY from quoted and escaped literals', () => {
+	for (const query of [
+		'summary ~ "ORDER BY"',
+		"summary ~ 'order by'",
+		'summary ~ "escaped \\" ORDER BY"',
+		'issueFunction in expression("order by")',
+	])
+		assert.doesNotThrow(() => buildPollingJql(query, 0));
+	for (const query of [
+		'project=A ORDER BY updated',
+		'ORDER\nBY updated',
+		'summary ~ "x" order by created',
+	])
+		assert.throws(() => buildPollingJql(query, 0), /ORDER BY/);
+	for (const query of ['project=(A', 'project=A)', 'summary ~ "unclosed'])
+		assert.throws(() => buildPollingJql(query, 0), /JQL/);
+	assert.throws(() => buildPollingJql('', NaN), /boundary/);
+});
+test('search follows tokens and requests timestamps and rendered descriptions on every page', async () => {
+	const calls = [];
+	const transport = new JiraTransport(async (request) => {
+		calls.push(request);
+		// No isLast: the token key alone decides whether a page is the last one.
+		return calls.length === 1
+			? { issues: [issue('1')], nextPageToken: 'next' }
+			: { issues: [issue('2')], nextPageToken: null };
+	});
+	assert.equal((await collect(transport.searchIssues('project=A', 10, ['summary']))).length, 2);
+	assert.equal(calls[0].path, '/rest/api/3/search/jql');
+	assert.equal(calls[0].method, 'POST');
+	for (const call of calls) {
+		assert.deepEqual(call.body.fields, ['created', 'updated', 'project', 'summary']);
+		assert.equal(call.body.expand, 'renderedFields');
+	}
+	assert.equal(calls[1].body.nextPageToken, 'next');
+});
+test('isLast is optional and cross-checked against the token key', async () => {
+	for (const last of [{ nextPageToken: '' }, { nextPageToken: null }, { isLast: true }]) {
+		assert.deepEqual(
+			await collect(
+				new JiraTransport(async () => ({ issues: [issue('1')], ...last })).searchIssues(
+					'',
+					0,
+					[],
+				),
+			),
+			[issue('1')],
+		);
+	}
+	for (const contradiction of [
+		{ isLast: true, nextPageToken: 'next' },
+		{ isLast: false, nextPageToken: '' },
+	]) {
+		await assert.rejects(
+			collect(
+				new JiraTransport(async () => ({
+					issues: [issue('1')],
+					...contradiction,
+				})).searchIssues('', 0, []),
+			),
+			/invalid search pagination/,
+		);
+	}
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({ issues: [issue('1')] })).searchIssues('', 0, []),
+		),
+		/invalid search pagination/,
+	);
+});
+test('search preserves structured and rendered descriptions without duplicating requested fields', async () => {
+	const returned = issue('1');
+	returned.fields.description = {
+		type: 'doc',
+		version: 1,
+		content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Details' }] }],
+	};
+	returned.renderedFields = { description: '<p>Details</p>' };
+	const transport = new JiraTransport(async (request) => {
+		assert.deepEqual(request.body.fields, ['created', 'updated', 'project', 'description']);
+		assert.equal(request.body.expand, 'renderedFields');
+		return { issues: [returned], isLast: true };
+	});
+	assert.deepEqual(await collect(transport.searchIssues('', 0, ['description'])), [returned]);
+});
+test('comment pagination fetches old comments, preserves raw data and advances by returned count', async () => {
+	const calls = [];
+	const transport = new JiraTransport(async (request) => {
+		calls.push(request);
+		return {
+			comments: [comment(String(calls.length))],
+			startAt: calls.length - 1,
+			maxResults: 100,
+			total: 2,
+		};
+	});
+	const comments = await collect(transport.comments('A/B'));
+	assert.deepEqual(comments, [comment('1'), comment('2')]);
+	assert.equal(calls[0].path, '/rest/api/3/issue/A%2FB/comment');
+	assert.equal(calls[1].qs.startAt, 1);
+	assert.equal(calls[0].qs.expand, 'renderedBody');
+	assert.equal(calls[0].qs.orderBy, 'created');
+});
+test('later page failures propagate and do not become partial success', async () => {
+	let calls = 0;
+	const transport = new JiraTransport(async () => {
+		if (++calls === 1) return { issues: [issue('1')], isLast: false, nextPageToken: 'next' };
+		throw { statusCode: 403, message: 'secret token' };
+	});
+	await assert.rejects(
+		collect(transport.searchIssues('', 0, [])),
+		(error) => /403/.test(error.message) && !/secret/.test(error.message),
+	);
+	assert.equal(calls, 2);
+});
+test('malformed and non-progressing pagination fail', async () => {
+	for (const response of [
+		{ issues: [] },
+		{ issues: [], isLast: false, nextPageToken: 'next' },
+		{ issues: [issue('1')], isLast: false },
+		{ issues: [{}], isLast: true },
+	]) {
+		await assert.rejects(
+			collect(new JiraTransport(async () => response).searchIssues('', 0, [])),
+			/invalid|advance/,
+		);
+	}
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({
+				issues: [issue('1')],
+				isLast: false,
+				nextPageToken: 'same',
+			})).searchIssues('', 0, []),
+		),
+		/advance/,
+	);
+	for (const response of [
+		{ comments: [], startAt: 0, total: 1, maxResults: 100 },
+		{ comments: [], startAt: 4, total: 1, maxResults: 100 },
+		{ comments: [], startAt: 0, total: -1, maxResults: 100 },
+	]) {
+		await assert.rejects(
+			collect(new JiraTransport(async () => response).comments('1')),
+			/invalid|advance/,
+		);
+	}
+});
+test('empty complete pages return no items', async () => {
+	assert.deepEqual(
+		await collect(
+			new JiraTransport(async () => ({ issues: [], isLast: true })).searchIssues('', 0, []),
+		),
+		[],
+	);
+	assert.deepEqual(
+		await collect(
+			new JiraTransport(async () => ({
+				comments: [],
+				startAt: 0,
+				total: 0,
+				maxResults: 100,
+			})).comments('1'),
+		),
+		[],
+	);
+});
+test('manual page limits and early iterator termination bound requests', async () => {
+	let calls = 0;
+	const transport = new JiraTransport(async () => ({
+		issues: [issue(String(++calls))],
+		isLast: false,
+		nextPageToken: String(calls),
+	}));
+	assert.equal((await collect(transport.searchIssues('', 0, [], { maxPages: 2 }))).length, 2);
+	assert.equal(calls, 2);
+	for await (const item of transport.searchIssues('', 0, [])) {
+		assert.ok(item);
+		break;
+	}
+	assert.equal(calls, 3);
+	await assert.rejects(collect(transport.searchIssues('', 0, [], { maxPages: 0 })), /limit/);
+});
+test('transient failures retry with exponential delay then succeed', async () => {
+	let calls = 0;
+	const waits = [];
+	const transport = new JiraTransport(
+		async () => {
+			if (++calls < 3) throw { response: { status: 503 } };
+			return { issues: [], isLast: true };
+		},
+		{
+			sleep: async (ms) => {
+				waits.push(ms);
+			},
+		},
+	);
+	await collect(transport.searchIssues('', 0, []));
+	assert.deepEqual(waits, [1000, 2000]);
+});
+test('Retry-After seconds and HTTP dates survive the NodeApiError wrapper', async () => {
+	for (const retryAfter of ['4', 'Thu, 01 Jan 1970 00:00:04 GMT']) {
+		let calls = 0;
+		const waits = [];
+		const transport = new JiraTransport(
+			async () => {
+				if (++calls === 1) throw nodeApiError(429, { 'Retry-After': retryAfter });
+				return { issues: [], isLast: true };
+			},
+			{
+				now: () => 0,
+				sleep: async (ms) => {
+					waits.push(ms);
+				},
+			},
+		);
+		await collect(transport.searchIssues('', 0, []));
+		assert.deepEqual(waits, [4000]);
+	}
+});
+test('retry budget fails without shortening excessive Retry-After', async () => {
+	let calls = 0;
+	let waited = false;
+	const transport = new JiraTransport(
+		async () => {
+			calls++;
+			throw nodeApiError(429, { 'retry-after': '120' });
+		},
+		{
+			sleep: async () => {
+				waited = true;
+			},
+		},
+	);
+	await assert.rejects(collect(transport.searchIssues('', 0, [])), /429/);
+	assert.equal(calls, 1);
+	assert.equal(waited, false);
+});
+test('a wrapped network failure retries on the code held under cause', async () => {
+	let calls = 0;
+	await assert.rejects(
+		collect(
+			new JiraTransport(
+				async () => {
+					calls++;
+					throw new NodeApiError(
+						fixtureNode,
+						Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+					);
+				},
+				{ sleep: async () => {} },
+			).searchIssues('', 0, []),
+		),
+		/Jira read failed/,
+	);
+	assert.equal(calls, 4);
+});
+test('network retries are bounded and permanent errors do not retry', async () => {
+	for (const [error, expected] of [
+		[{ code: 'ECONNRESET' }, 4],
+		[{ statusCode: 401 }, 1],
+		[{ statusCode: 400 }, 1],
+	]) {
+		let calls = 0;
+		await assert.rejects(
+			collect(
+				new JiraTransport(
+					async () => {
+						calls++;
+						throw error;
+					},
+					{ sleep: async () => {} },
+				).searchIssues('', 0, []),
+			),
+			/Jira read failed/,
+		);
+		assert.equal(calls, expected);
+	}
+});
+
+test('search warnings cannot silently accept potentially truncated results', async () => {
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({
+				issues: [issue('1')],
+				isLast: true,
+				warnings: [{ message: 'secret private query' }],
+			})).searchIssues('', 0, []),
+		),
+		(error) => /incomplete/.test(error.message) && !/secret/.test(error.message),
+	);
+});
+
+test('repeated entities fail even when pagination markers keep advancing', async () => {
+	let calls = 0;
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({
+				issues: [issue('1')],
+				isLast: false,
+				nextPageToken: String(++calls),
+			})).searchIssues('', 0, []),
+		),
+		/repeated/,
+	);
+	calls = 0;
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({
+				comments: [comment('1')],
+				startAt: calls++,
+				maxResults: 100,
+				total: 3,
+			})).comments('1'),
+		),
+		/repeated/,
+	);
+});
