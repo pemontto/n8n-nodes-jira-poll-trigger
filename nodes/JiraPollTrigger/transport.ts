@@ -55,7 +55,8 @@ export function buildPollingJql(
 	predicate: string,
 	lowerBound: number,
 	direction: 'ASC' | 'DESC' = 'ASC',
-	afterId?: string,
+	afterCreated?: number,
+	afterKeys?: string[],
 	createdBefore?: number,
 ): string {
 	if (
@@ -64,7 +65,18 @@ export function buildPollingJql(
 		(createdBefore !== undefined && (!Number.isSafeInteger(createdBefore) || createdBefore < 0))
 	)
 		throw new Error('Invalid polling boundary.');
-	if (afterId !== undefined && !/^\d{1,15}$/.test(afterId))
+	if (
+		afterCreated !== undefined &&
+		(!Number.isSafeInteger(afterCreated) || afterCreated < 0 || !afterKeys?.length)
+	)
+		throw new Error('Invalid polling continuation.');
+	if (
+		afterKeys !== undefined &&
+		(!Array.isArray(afterKeys) ||
+			afterKeys.length === 0 ||
+			afterKeys.some((key) => typeof key !== 'string' || !key) ||
+			afterCreated === undefined)
+	)
 		throw new Error('Invalid polling continuation.');
 	let quote = '';
 	let depth = 0;
@@ -89,14 +101,21 @@ export function buildPollingJql(
 	if (quote || depth) throw new Error('JQL contains an unclosed quote or parenthesis.');
 	if (/\border\s+by\b/i.test(visible))
 		throw new Error('Remove the top-level ORDER BY clause from JQL.');
-	// Unquoted numbers are epoch milliseconds and compare at that precision.
-	// Order by ID, which an edit cannot move, so an interrupted scan continues
-	// with `id > afterId` and every issue of the window is visited once. The
-	// creation bound is immutable too, so the window stays finite under load.
+	// Creation time is immutable and Jira compares date bounds at minute
+	// precision. Exclude keys already processed at that minute to resume across
+	// projects without relying on Jira's per-project numeric `id` comparisons.
 	const bound = `updated >= ${lowerBound}${
 		createdBefore === undefined ? '' : ` AND created <= ${createdBefore}`
-	}${afterId === undefined ? '' : ` AND id > ${afterId}`}`;
-	return `${predicate.trim() ? `(${predicate.trim()}) AND ` : ''}${bound} ORDER BY id ${direction}`;
+	}${
+		afterCreated === undefined
+			? ''
+			: ` AND (created >= ${afterCreated} AND key NOT IN (${afterKeys!.map(jqlString).join(', ')}))`
+	}`;
+	return `${predicate.trim() ? `(${predicate.trim()}) AND ` : ''}${bound} ORDER BY created ${direction}, key ${direction}`;
+}
+
+function jqlString(value: string): string {
+	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 function httpStatus(value: unknown): number | undefined {
@@ -105,9 +124,12 @@ function httpStatus(value: unknown): number | undefined {
 }
 
 export function retryDetails(error: unknown): {
-	status: number;
+	status?: number;
 	headers: JsonRecord;
 	code: unknown;
+	details?: string;
+	transient: boolean;
+	timedOut: boolean;
 } {
 	// NodeApiError keeps the axios error under `cause` only, so walk the chain.
 	// Its `httpCode` holds a network code such as ECONNRESET when there is no
@@ -115,9 +137,18 @@ export function retryDetails(error: unknown): {
 	let status: number | undefined;
 	let headers: JsonRecord | undefined;
 	let code: unknown;
+	let details: string | undefined;
+	let timedOut = false;
 	let source: unknown = error;
 	for (let depth = 0; depth < 5 && record(source); depth++) {
 		const response = record(source.response) ? source.response : {};
+		const data = record(response.data)
+			? response.data
+			: record(source.data)
+				? source.data
+				: record(source.body)
+					? source.body
+					: {};
 		status ??=
 			httpStatus(source.statusCode) ??
 			httpStatus(source.httpCode) ??
@@ -130,9 +161,34 @@ export function retryDetails(error: unknown): {
 				? source.headers
 				: undefined;
 		code ??= source.code ?? source.httpCode;
+		const jiraDetails = jiraMessageText(data);
+		if (jiraDetails) details = jiraDetails;
+		else details ??= stringValue(source.description);
+		timedOut ||= /timeout|timed out/i.test(String(source.message ?? ''));
 		source = source.cause;
 	}
-	return { status: Number(status), headers: headers ?? {}, code };
+	const timedOutCode = ['ETIMEDOUT', 'ECONNABORTED', 'ESOCKETTIMEDOUT'].includes(String(code));
+	timedOut ||= timedOutCode;
+	const transient =
+		[408, 429, 500, 502, 503, 504].includes(status ?? 0) ||
+		['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNABORTED', 'ESOCKETTIMEDOUT'].includes(
+			String(code),
+		);
+	return { status, headers: headers ?? {}, code, details, transient, timedOut };
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function jiraMessageText(body: JsonRecord): string | undefined {
+	const messages = [body.errorMessages, body.warningMessages]
+		.flatMap((value) => (Array.isArray(value) ? value : []))
+		.map((value) =>
+			typeof value === 'string' ? value : record(value) ? stringValue(value.message) : undefined,
+		)
+		.filter((value): value is string => value !== undefined);
+	return messages.length ? [...new Set(messages)].join('; ') : undefined;
 }
 
 export class JiraTransport {
@@ -172,16 +228,19 @@ export class JiraTransport {
 			try {
 				result = await this.read({ ...request, timeout });
 			} catch (error) {
-				const { status, headers, code } = retryDetails(error);
-				const transient =
-					[408, 429, 500, 502, 503, 504].includes(status) ||
-					['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNABORTED'].includes(String(code));
-				const known = Number.isInteger(status) && status >= 100 && status <= 599;
+				const { status, headers, code, details, transient, timedOut } = retryDetails(error);
+				const known = status !== undefined;
+				const description = details ? ` Jira response: ${details}.` : '';
+				const message = timedOut
+					? `Jira read timed out${known ? ` (HTTP ${status})` : ''}.${description} Retry the poll.`
+					: `Jira read failed${known ? ` (HTTP ${status})` : ''}.${description} ${transient ? 'Retry the poll.' : 'Check Jira access and retry the poll.'}`;
 				const failure = () =>
-					new JiraReadError(
-						`Jira read failed${known ? ` (HTTP ${status})` : ''}. Check access and retry the poll.`,
-						known ? status : undefined,
-					);
+					new JiraReadError(message, known ? status : undefined, {
+						details,
+						code,
+						transient,
+						timedOut,
+					});
 				if (!transient) throw failure();
 				const retryAfter = Object.entries(headers).find(
 					([key]) => key.toLowerCase() === 'retry-after',
@@ -201,6 +260,10 @@ export class JiraTransport {
 					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 					throw new PollBudgetExhausted(
 						Number.isInteger(status) ? `HTTP ${status}` : String(code ?? 'request failed'),
+						status,
+						details,
+						code,
+						timedOut,
 					);
 				if (attempt >= this.maxRetries) throw failure();
 				// Do not shorten a server-requested wait just to fit the retry budget.
@@ -210,6 +273,24 @@ export class JiraTransport {
 			}
 			if (!record(result)) throw new Error('Jira returned an invalid response.');
 			return result;
+		}
+	}
+
+	private async issueWasDeleted(issueId: string): Promise<boolean> {
+		// Establish that the credential still works before interpreting an issue 404.
+		await this.request({ method: 'GET', path: `/rest/api/${this.apiVersion}/myself` });
+		try {
+			await this.request({
+				method: 'GET',
+				path: `/rest/api/${this.apiVersion}/issue/${encodeURIComponent(issueId)}`,
+				qs: { fields: 'id' },
+			});
+			return false;
+		} catch (error) {
+			if (error instanceof JiraReadError && error.status === 404) return true;
+			// Preserve the auth and network error for the node entry point.
+			// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+			throw error;
 		}
 	}
 
@@ -230,7 +311,8 @@ export class JiraTransport {
 			predicate,
 			lowerBound,
 			limits.direction,
-			limits.afterId,
+			limits.afterCreated,
+			limits.afterKeys,
 			limits.createdBefore,
 		);
 		const limit = this.pageLimit(limits);
@@ -257,9 +339,12 @@ export class JiraTransport {
 					...(nextPageToken ? { nextPageToken } : {}),
 				},
 			});
+			const warningValues = [result.warnings, result.warningMessages].filter(
+				(value) => value !== undefined,
+			);
 			if (
-				result.warnings !== undefined &&
-				(!Array.isArray(result.warnings) || result.warnings.length > 0)
+				warningValues.some((value) => !Array.isArray(value)) ||
+				warningValues.some((value) => Array.isArray(value) && value.length > 0)
 			)
 				throw new Error(
 					'Jira search returned warnings and may be incomplete. Narrow the JQL before retrying.',
@@ -327,16 +412,35 @@ export class JiraTransport {
 		let verify = resumeAt > 0;
 		const commentIds = new Set<string>();
 		for (let page = 0; page < limit; page++) {
-			const result = await this.request({
-				method: 'GET',
-				path: `/rest/api/${this.apiVersion}/issue/${encodeURIComponent(issueId)}/comment`,
-				qs: {
-					startAt,
-					maxResults: 100,
-					orderBy: 'created',
-					expand: 'renderedBody',
-				},
-			});
+			let result: JsonRecord;
+			try {
+				result = await this.request({
+					method: 'GET',
+					path: `/rest/api/${this.apiVersion}/issue/${encodeURIComponent(issueId)}/comment`,
+					qs: {
+						startAt,
+						maxResults: 100,
+						orderBy: 'created',
+						expand: 'renderedBody',
+					},
+				});
+			} catch (error) {
+				if (
+					error instanceof JiraReadError &&
+					error.status === 404 &&
+					(await this.issueWasDeleted(issueId))
+				)
+					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+					throw new JiraReadError(error.message, error.status, {
+						details: error.details,
+						code: error.code,
+						transient: error.transient,
+						timedOut: error.timedOut,
+						issueMissing: true,
+					});
+				// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+				throw error;
+			}
 			if (
 				!Array.isArray(result.comments) ||
 				!result.comments.every(

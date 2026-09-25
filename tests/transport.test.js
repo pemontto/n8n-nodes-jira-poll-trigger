@@ -91,7 +91,7 @@ test('API v2 paginates issues and comments while preserving native wiki markup a
 	for (const request of calls.slice(0, 2)) {
 		assert.equal(request.path, '/rest/api/2/search/jql');
 		assert.equal(request.body.expand, 'renderedFields');
-		assert.equal(request.body.jql, '(project=A) AND updated >= 10 ORDER BY id ASC');
+		assert.equal(request.body.jql, '(project=A) AND updated >= 10 ORDER BY created ASC, key ASC');
 	}
 	for (const request of calls.slice(2)) {
 		assert.equal(request.path, '/rest/api/2/issue/A%2FB/comment');
@@ -103,15 +103,18 @@ test('API v2 paginates issues and comments while preserving native wiki markup a
 test('JQL groups OR predicates and uses epoch lower boundary without an upper constraint', () => {
 	assert.equal(
 		buildPollingJql('project=A OR project=B', 1234),
-		'(project=A OR project=B) AND updated >= 1234 ORDER BY id ASC',
+		'(project=A OR project=B) AND updated >= 1234 ORDER BY created ASC, key ASC',
 	);
-	assert.equal(buildPollingJql('  ', 0), 'updated >= 0 ORDER BY id ASC');
+	assert.equal(buildPollingJql('  ', 0), 'updated >= 0 ORDER BY created ASC, key ASC');
 });
 test('JQL sorts ascending by default and descending on request', async () => {
-	assert.equal(buildPollingJql('project=A', 1), '(project=A) AND updated >= 1 ORDER BY id ASC');
+	assert.equal(
+		buildPollingJql('project=A', 1),
+		'(project=A) AND updated >= 1 ORDER BY created ASC, key ASC',
+	);
 	assert.equal(
 		buildPollingJql('project=A', 1, 'DESC'),
-		'(project=A) AND updated >= 1 ORDER BY id DESC',
+		'(project=A) AND updated >= 1 ORDER BY created DESC, key DESC',
 	);
 	const requests = [];
 	const transport = new JiraTransport(async (request) => {
@@ -123,8 +126,8 @@ test('JQL sorts ascending by default and descending on request', async () => {
 	assert.deepEqual(
 		requests.map((request) => request.body.jql),
 		[
-			'(project=A) AND updated >= 10 ORDER BY id ASC',
-			'(project=A) AND updated >= 10 ORDER BY id DESC',
+			'(project=A) AND updated >= 10 ORDER BY created ASC, key ASC',
+			'(project=A) AND updated >= 10 ORDER BY created DESC, key DESC',
 		],
 	);
 });
@@ -402,6 +405,53 @@ test('network retries are bounded and permanent errors do not retry', async () =
 	}
 });
 
+test('permanent Jira errors retain status and Jira error and warning text', async () => {
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => {
+				throw Object.assign(new Error('Request failed'), {
+					response: {
+						status: 403,
+						data: {
+							errorMessages: ['Permission denied.'],
+							warningMessages: ['Token revoked.'],
+						},
+					},
+				});
+			}).searchIssues('', 0, []),
+		),
+		(error) => {
+			assert.equal(error.status, 403);
+			assert.equal(error.details, 'Permission denied.; Token revoked.');
+			assert.match(error.message, /HTTP 403/);
+			assert.match(error.message, /Permission denied\./);
+			assert.match(error.message, /Token revoked\./);
+			return true;
+		},
+	);
+});
+
+test('timed out reads are labelled as timeouts rather than access failures', async () => {
+	await assert.rejects(
+		collect(
+			new JiraTransport(
+				async () => {
+					throw Object.assign(new Error('timeout of 30 seconds exceeded'), {
+						code: 'ECONNABORTED',
+					});
+				},
+				{ maxRetries: 0 },
+			).searchIssues('', 0, []),
+		),
+		(error) => {
+			assert.equal(error.timedOut, true);
+			assert.match(error.message, /timed out/i);
+			assert.doesNotMatch(error.message, /check Jira access/i);
+			return true;
+		},
+	);
+});
+
 test('search warnings cannot silently accept potentially truncated results', async () => {
 	await assert.rejects(
 		collect(
@@ -412,6 +462,16 @@ test('search warnings cannot silently accept potentially truncated results', asy
 			})).searchIssues('', 0, []),
 		),
 		(error) => /incomplete/.test(error.message) && !/secret/.test(error.message),
+	);
+	await assert.rejects(
+		collect(
+			new JiraTransport(async () => ({
+				issues: [],
+				isLast: true,
+				warningMessages: ['private warning'],
+			})).searchIssues('', 0, []),
+		),
+		(error) => /incomplete/.test(error.message) && !/private warning/.test(error.message),
 	);
 });
 
@@ -440,16 +500,16 @@ test('repeated entities fail even when pagination markers keep advancing', async
 		/repeated/,
 	);
 });
-test('a continuation adds creation and ID bounds and rejects a non-numeric ID', () => {
+test('a continuation resumes by creation minute and handled keys', () => {
 	assert.equal(
-		buildPollingJql('project=A', 61_500, 'ASC', '42', 70_000),
-		'(project=A) AND updated >= 61500 AND created <= 70000 AND id > 42 ORDER BY id ASC',
+		buildPollingJql('project=A', 61_500, 'ASC', 60_000, ['PROJ-42'], 70_000),
+		'(project=A) AND updated >= 61500 AND created <= 70000 AND (created >= 60000 AND key NOT IN ("PROJ-42")) ORDER BY created ASC, key ASC',
 	);
 	assert.equal(
-		buildPollingJql('project=A', 61_500, 'ASC', '42'),
-		'(project=A) AND updated >= 61500 AND id > 42 ORDER BY id ASC',
+		buildPollingJql('project=A', 61_500, 'ASC', 60_000, ['PROJ-42']),
+		'(project=A) AND updated >= 61500 AND (created >= 60000 AND key NOT IN ("PROJ-42")) ORDER BY created ASC, key ASC',
 	);
-	assert.throws(() => buildPollingJql('', 1, 'ASC', 'x'), /continuation/);
+	assert.throws(() => buildPollingJql('', 1, 'ASC', 60_000, []), /continuation/);
 });
 test('the deadline caps every timeout, refuses a request once passed, and stops rather than sleeping past it', async () => {
 	const { PollBudgetExhausted } = require('../dist/nodes/JiraPollTrigger/poll-state');

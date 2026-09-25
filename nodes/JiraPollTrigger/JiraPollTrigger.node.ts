@@ -24,6 +24,7 @@ import {
 	type Issue,
 	type Comment,
 	PollBudgetExhausted,
+	JiraReadError,
 } from './poll-state';
 import {
 	JiraTransport,
@@ -350,6 +351,25 @@ export class JiraPollTrigger implements INodeType {
 				}
 				return items;
 			} catch (error) {
+				// Preserve existing n8n API and operation error metadata.
+				// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+				if (error instanceof NodeApiError || error instanceof NodeOperationError) throw error;
+				if (error instanceof JiraReadError)
+					throw new NodeApiError(
+						this.getNode(),
+						{ errorMessages: error.details ? [error.details] : [], message: error.message },
+						{
+							message: error.message,
+							description: error.details ??
+								(error.timedOut ? 'Timed out while reading from Jira.' : undefined),
+							httpCode:
+								error.status !== undefined
+									? String(error.status)
+									: error.timedOut && typeof error.code === 'string'
+										? error.code
+										: undefined,
+						},
+					);
 				throw new NodeOperationError(
 					this.getNode(),
 					error instanceof Error ? error.message : 'Jira polling failed',

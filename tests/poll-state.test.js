@@ -4,6 +4,7 @@ const {
 	scanPoll,
 	serializePoll,
 	MAX_DEDUP_KEYS,
+	JiraReadError,
 } = require('../dist/nodes/JiraPollTrigger/poll-state.js');
 const iso = (n) => new Date(n).toISOString();
 const config = {
@@ -316,6 +317,33 @@ test('under a budget the cap stops the scan with its progress saved instead of e
 	assert.equal(result.state.checkpoint, 1000);
 	assert.equal(result.state.window.partial.issue.id, '1');
 	assert.ok(result.state.seen.length <= MAX_DEDUP_KEYS);
+	assert.deepEqual(previous, state());
+});
+test('a transient Jira read failure after earlier issue events hands over the processed prefix', async () => {
+	const previous = state();
+	const result = await scanPoll({
+		config: { ...config, resource: 'issue' },
+		state: previous,
+		pollStart: 1300,
+		budgeted: true,
+		source: {
+			async *issues() {
+				yield issue;
+				throw new JiraReadError('Jira read failed (HTTP 429). Retry the poll.', 429, {
+					transient: true,
+				});
+			},
+			async *comments() {},
+		},
+	});
+	assert.deepEqual(
+		result.events.map((event) => event.eventType),
+		['issue.created', 'issue.updated'],
+	);
+	assert.match(result.stopped, /HTTP 429/);
+	assert.equal(result.stopError.status, 429);
+	assert.equal(result.state.checkpoint, previous.checkpoint);
+	assert.deepEqual(result.state.window.afterKeys, ['TEST-1']);
 	assert.deepEqual(previous, state());
 });
 test('stale polls and corrupt state fail explicitly', async () => {
