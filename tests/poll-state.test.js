@@ -280,6 +280,7 @@ test('ordinary restart resumes serialised saved state', async () => {
 });
 test('cap fails instead of evicting keys or mutating saved state', async () => {
 	const previous = state();
+	const original = structuredClone(previous);
 	await assert.rejects(
 		poll([], {
 			state: previous,
@@ -294,6 +295,27 @@ test('cap fails instead of evicting keys or mutating saved state', async () => {
 		}),
 		/40,000/,
 	);
+	assert.deepEqual(previous, original);
+});
+test('under a budget the cap stops the scan with its progress saved instead of evicting keys or mutating saved state', async () => {
+	const previous = state();
+	const result = await poll([], {
+		state: previous,
+		budgeted: true,
+		source: {
+			async *issues() {
+				yield issue;
+			},
+			async *comments() {
+				for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
+			},
+		},
+	});
+	assert.equal(result.events.length, MAX_DEDUP_KEYS);
+	assert.match(result.stopped, /40,000/);
+	assert.equal(result.state.checkpoint, 1000);
+	assert.equal(result.state.window.partial.issue.id, '1');
+	assert.ok(result.state.seen.length <= MAX_DEDUP_KEYS);
 	assert.deepEqual(previous, state());
 });
 test('stale polls and corrupt state fail explicitly', async () => {
@@ -345,46 +367,84 @@ test('invalid resource and event values fail before activation', async () => {
 		);
 });
 test('cap also bounds deduplication while scanning an old backlog', async () => {
-	await assert.rejects(
-		poll([], {
-			pollStart: 10000,
-			source: {
-				async *issues() {
-					yield issue;
-				},
-				async *comments() {
-					for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
-				},
+	const result = await poll([], {
+		pollStart: 10000,
+		budgeted: true,
+		source: {
+			async *issues() {
+				yield issue;
 			},
-		}),
-		/40,000/,
-	);
+			async *comments() {
+				for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
+			},
+		},
+	});
+	assert.equal(result.events.length, MAX_DEDUP_KEYS);
+	assert.ok(result.state.window);
 });
 
 test('public event IDs are readable, tenant-scoped and independent of stored dedup keys', async () => {
- const one=await poll([comment()],{config:{...config,site:'one.atlassian.net'}});
- assert.equal(one.events[0].eventId,'one.atlassian.net/comment/1/2/created/1100');
- assert.equal(one.events[1].eventId,'one.atlassian.net/comment/1/2/updated/1200');
- const two=await poll([comment()],{config:{...config,site:'two.atlassian.net'}});
- assert.notEqual(one.events[0].eventId,two.events[0].eventId);
- assert(one.state.seen.some(entry=>entry.key===JSON.stringify(['comment','1','2','created',1100])));
- const repeat=await poll([comment()],{config:{...config,site:'one.atlassian.net'},state:one.state,pollStart:1400});
- assert.equal(repeat.events.length,0);
+	const one = await poll([comment()], { config: { ...config, site: 'one.atlassian.net' } });
+	assert.equal(one.events[0].eventId, 'one.atlassian.net/comment/1/2/created/1100');
+	assert.equal(one.events[1].eventId, 'one.atlassian.net/comment/1/2/updated/1200');
+	const two = await poll([comment()], { config: { ...config, site: 'two.atlassian.net' } });
+	assert.notEqual(one.events[0].eventId, two.events[0].eventId);
+	assert(
+		one.state.seen.some(
+			(entry) => entry.key === JSON.stringify(['comment', '1', '2', 'created', 1100]),
+		),
+	);
+	const repeat = await poll([comment()], {
+		config: { ...config, site: 'one.atlassian.net' },
+		state: one.state,
+		pollStart: 1400,
+	});
+	assert.equal(repeat.events.length, 0);
 });
 
 test('manual event limit stops during a combined comment and closes both generators', async () => {
-  let issueClosed = false, commentClosed = false, reads = 0;
-  const boundedSource = {
-    async *issues() { try { yield issue; throw new Error('unexpected next issue'); } finally { issueClosed = true; } },
-    async *comments() { try { for (let n = 0; n < 5; n++) { reads++; yield comment(1100, 1200, { id: String(n) }); } } finally { commentClosed = true; } },
-  };
-  const before = state(), snapshot = structuredClone(before);
-  const result = await poll([], { state: before, source: boundedSource, manual: true, manualLimit: 3 });
-  assert.deepEqual(result.events.map(event => event.eventType), ['comment.created', 'comment.updated', 'comment.created']);
-  assert.equal(reads, 2); assert.equal(issueClosed, true); assert.equal(commentClosed, true);
-  assert.equal(result.state, before); assert.deepEqual(before, snapshot);
+	let issueClosed = false,
+		commentClosed = false,
+		reads = 0;
+	const boundedSource = {
+		async *issues() {
+			try {
+				yield issue;
+				throw new Error('unexpected next issue');
+			} finally {
+				issueClosed = true;
+			}
+		},
+		async *comments() {
+			try {
+				for (let n = 0; n < 5; n++) {
+					reads++;
+					yield comment(1100, 1200, { id: String(n) });
+				}
+			} finally {
+				commentClosed = true;
+			}
+		},
+	};
+	const before = state(),
+		snapshot = structuredClone(before);
+	const result = await poll([], {
+		state: before,
+		source: boundedSource,
+		manual: true,
+		manualLimit: 3,
+	});
+	assert.deepEqual(
+		result.events.map((event) => event.eventType),
+		['comment.created', 'comment.updated', 'comment.created'],
+	);
+	assert.equal(reads, 2);
+	assert.equal(issueClosed, true);
+	assert.equal(commentClosed, true);
+	assert.equal(result.state, before);
+	assert.deepEqual(before, snapshot);
 });
 test('manual limit allows fewer events when the bounded source is exhausted', async () => {
-  const result = await poll([comment()], { manual: true, manualLimit: 10 });
-  assert.equal(result.events.length, 2);
+	const result = await poll([comment()], { manual: true, manualLimit: 10 });
+	assert.equal(result.events.length, 2);
 });

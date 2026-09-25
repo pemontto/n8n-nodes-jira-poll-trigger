@@ -10,6 +10,21 @@ function digest(state: PollState | undefined): string {
 				state.fingerprint,
 				state.activation,
 				state.checkpoint,
+				state.window
+					? [
+							state.window.since,
+							state.window.until,
+							state.window.afterId ?? null,
+							state.window.partial
+								? [
+										state.window.partial.issue.id,
+										state.window.partial.startAt,
+										state.window.partial.lastCommentId,
+										state.window.partial.done,
+									]
+								: null,
+						]
+					: null,
 				state.seen
 					.map(({ key, time }) => [key, time])
 					.sort((a, b) => String(a[0]).localeCompare(String(b[0]))),

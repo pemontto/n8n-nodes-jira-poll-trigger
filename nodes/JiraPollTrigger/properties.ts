@@ -2,6 +2,16 @@ import type { INodeProperties } from 'n8n-workflow';
 
 export const properties: INodeProperties[] = [
 	{
+		displayName: 'Authentication',
+		name: 'authentication',
+		type: 'options',
+		options: [
+			{ name: 'API Token', value: 'apiToken' },
+			{ name: 'OAuth2', value: 'oAuth2' },
+		],
+		default: 'apiToken',
+	},
+	{
 		displayName: 'Resource',
 		name: 'resource',
 		noDataExpression: true,

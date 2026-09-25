@@ -168,11 +168,7 @@ test('isLast is optional and cross-checked against the token key', async () => {
 	for (const last of [{ nextPageToken: '' }, { nextPageToken: null }, { isLast: true }]) {
 		assert.deepEqual(
 			await collect(
-				new JiraTransport(async () => ({ issues: [issue('1')], ...last })).searchIssues(
-					'',
-					0,
-					[],
-				),
+				new JiraTransport(async () => ({ issues: [issue('1')], ...last })).searchIssues('', 0, []),
 			),
 			[issue('1')],
 		);
@@ -192,9 +188,7 @@ test('isLast is optional and cross-checked against the token key', async () => {
 		);
 	}
 	await assert.rejects(
-		collect(
-			new JiraTransport(async () => ({ issues: [issue('1')] })).searchIssues('', 0, []),
-		),
+		collect(new JiraTransport(async () => ({ issues: [issue('1')] })).searchIssues('', 0, [])),
 		/invalid search pagination/,
 	);
 });
@@ -445,4 +439,130 @@ test('repeated entities fail even when pagination markers keep advancing', async
 		),
 		/repeated/,
 	);
+});
+test('a continuation adds creation and ID bounds and rejects a non-numeric ID', () => {
+	assert.equal(
+		buildPollingJql('project=A', 61_500, 'ASC', '42', 70_000),
+		'(project=A) AND updated >= 61500 AND created <= 70000 AND id > 42 ORDER BY id ASC',
+	);
+	assert.equal(
+		buildPollingJql('project=A', 61_500, 'ASC', '42'),
+		'(project=A) AND updated >= 61500 AND id > 42 ORDER BY id ASC',
+	);
+	assert.throws(() => buildPollingJql('', 1, 'ASC', 'x'), /continuation/);
+});
+test('the deadline caps every timeout, refuses a request once passed, and stops rather than sleeping past it', async () => {
+	const { PollBudgetExhausted } = require('../dist/nodes/JiraPollTrigger/poll-state');
+	let clock = 0;
+	const calls = [];
+	const transport = new JiraTransport(
+		async (request) => {
+			calls.push(request);
+			clock += 500;
+			return {
+				issues: [issue(String(calls.length))],
+				isLast: false,
+				nextPageToken: `p${calls.length}`,
+			};
+		},
+		{ now: () => clock, deadline: 1_200 },
+	);
+	const issues = [];
+	await assert.rejects(
+		(async () => {
+			for await (const item of transport.searchIssues('', 0, [])) issues.push(item);
+		})(),
+		PollBudgetExhausted,
+	);
+	assert.deepEqual(
+		calls.map((call) => call.timeout),
+		[1_200, 700, 200],
+	);
+	assert.equal(issues.length, 3);
+	const { requestTimeout } = require('../dist/nodes/JiraPollTrigger/transport');
+	assert.equal(requestTimeout(1_000, 999), 1);
+	assert.equal(requestTimeout(undefined, 0), 30_000);
+	assert.throws(() => requestTimeout(1_000, 1_000), PollBudgetExhausted);
+	const sleeps = [];
+	let attempts = 0;
+	await assert.rejects(
+		collect(
+			new JiraTransport(
+				async () => {
+					attempts++;
+					throw nodeApiError(429, { 'Retry-After': '5' });
+				},
+				{ now: () => 0, deadline: 4_000, sleep: async (ms) => sleeps.push(ms) },
+			).searchIssues('', 0, []),
+		),
+		PollBudgetExhausted,
+	);
+	assert.equal(attempts, 1);
+	assert.deepEqual(sleeps, []);
+});
+test('a timeout on the final retry at the deadline is a budget stop, but a 401 is not', async () => {
+	const { PollBudgetExhausted } = require('../dist/nodes/JiraPollTrigger/poll-state');
+	let clock = 0;
+	let attempts = 0;
+	await assert.rejects(
+		collect(
+			new JiraTransport(
+				async () => {
+					attempts++;
+					clock = 10_000;
+					throw { code: 'ECONNABORTED' };
+				},
+				{ now: () => clock, deadline: 10_000, maxRetries: 0, sleep: async () => {} },
+			).searchIssues('', 0, []),
+		),
+		PollBudgetExhausted,
+	);
+	assert.equal(attempts, 1);
+	await assert.rejects(
+		collect(
+			new JiraTransport(
+				async () => {
+					throw { statusCode: 401 };
+				},
+				{ now: () => 0, deadline: 10_000 },
+			).searchIssues('', 0, []),
+		),
+		/HTTP 401/,
+	);
+});
+test('comments resume one comment early, verify it, and restart from the top after a deletion', async () => {
+	const run = async (resumeAfter) => {
+		const calls = [];
+		const progress = [];
+		const transport = new JiraTransport(async (request) => {
+			calls.push(request.qs.startAt);
+			return {
+				comments: [comment(String(request.qs.startAt))],
+				startAt: request.qs.startAt,
+				maxResults: 1,
+				total: 302,
+			};
+		});
+		const items = await collect(
+			transport.comments('1', {
+				resumeAt: 300,
+				resumeAfter,
+				maxPages: 3,
+				progress: (next, last) => progress.push([next, last]),
+			}),
+		);
+		return { calls, progress, ids: items.map((item) => item.id) };
+	};
+	assert.deepEqual(await run('299'), {
+		calls: [299, 300, 301],
+		progress: [
+			[300, '299'],
+			[301, '300'],
+			[302, '301'],
+		],
+		ids: ['299', '300', '301'],
+	});
+	assert.deepEqual((await run('deleted')).calls, [299, 0, 1, 2]);
+	const transport = new JiraTransport(async () => ({}));
+	await assert.rejects(collect(transport.comments('1', { resumeAt: -1 })), /continuation/);
 });
