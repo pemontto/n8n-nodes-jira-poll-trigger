@@ -106,6 +106,10 @@ test('JQL groups OR predicates and uses epoch lower boundary without an upper co
 		'(project=A OR project=B) AND updated >= 1234 ORDER BY created ASC, key ASC',
 	);
 	assert.equal(buildPollingJql('  ', 0), 'updated >= 0 ORDER BY created ASC, key ASC');
+	assert.equal(
+		buildPollingJql('project=A', 10, 'ASC', 60, 120),
+		'(project=A) AND updated >= 10 AND created <= 120 AND created >= 60 ORDER BY created ASC, key ASC',
+	);
 });
 test('JQL sorts ascending by default and descending on request', async () => {
 	assert.equal(
@@ -500,16 +504,16 @@ test('repeated entities fail even when pagination markers keep advancing', async
 		/repeated/,
 	);
 });
-test('a continuation resumes by creation minute and handled keys', () => {
+test('a continuation resumes by creation minute without naming handled keys', () => {
 	assert.equal(
-		buildPollingJql('project=A', 61_500, 'ASC', 60_000, ['PROJ-42'], 70_000),
-		'(project=A) AND updated >= 61500 AND created <= 70000 AND (created >= 60000 AND key NOT IN ("PROJ-42")) ORDER BY created ASC, key ASC',
+		buildPollingJql('project=A', 61_500, 'ASC', 60_000, 70_000),
+		'(project=A) AND updated >= 61500 AND created <= 70000 AND created >= 60000 ORDER BY created ASC, key ASC',
 	);
 	assert.equal(
-		buildPollingJql('project=A', 61_500, 'ASC', 60_000, ['PROJ-42']),
-		'(project=A) AND updated >= 61500 AND (created >= 60000 AND key NOT IN ("PROJ-42")) ORDER BY created ASC, key ASC',
+		buildPollingJql('project=A', 61_500, 'ASC', 60_000),
+		'(project=A) AND updated >= 61500 AND created >= 60000 ORDER BY created ASC, key ASC',
 	);
-	assert.throws(() => buildPollingJql('', 1, 'ASC', 60_000, []), /continuation/);
+	assert.throws(() => buildPollingJql('', 1, 'ASC', NaN), /continuation/);
 });
 test('the deadline caps every timeout, refuses a request once passed, and stops rather than sleeping past it', async () => {
 	const { PollBudgetExhausted } = require('../dist/nodes/JiraPollTrigger/poll-state');

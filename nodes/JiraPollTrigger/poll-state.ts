@@ -26,7 +26,8 @@ export interface PollConfig {
  * A window the poll budget interrupted. Its events lie in [since, until] and
  * its issues were created by `until`, a bound no edit can move, so the scan is
  * finite. It runs in immutable creation-time order and resumes at a minute
- * boundary while excluding issue keys already handled at that position.
+ * boundary while skipping issue keys already handled at that position in
+ * code, so unavailable keys are never sent to Jira.
  */
 export interface PollWindow {
 	since: number;
@@ -37,6 +38,10 @@ export interface PollWindow {
 	afterCreated?: number;
 	/** Issue keys already processed at afterCreated. */
 	afterKeys?: string[];
+	/** Jira's opaque next-page token for the open search window. */
+	pageToken?: string;
+	/** Creation bound used by the query that produced `pageToken`. */
+	pageTokenAfterCreated?: number;
 	/**
 	 * Issue whose comments are outstanding: its search payload, the first unread
 	 * offset, the comment before that offset, and whether it was finished ahead
@@ -63,9 +68,13 @@ export interface PollEvent {
 	comment?: Comment;
 }
 export interface SearchReadOptions {
-	/** Resume at this creation minute, excluding keys already handled there. */
+	/** Resume at this creation minute; `afterKeys` are skipped by the scanner. */
 	afterCreated?: number;
 	afterKeys?: string[];
+	/** Resume from this Jira search page after a poll stop. */
+	pageToken?: string;
+	/** Called after every fully consumed issue page. */
+	pageProgress?: (nextPageToken: string | undefined) => void;
 	/** Return only issues created at or before this epoch millisecond. */
 	createdBefore?: number;
 }
@@ -147,6 +156,12 @@ function validateState(state: PollState): void {
 						window.afterKeys.length < 1 ||
 						window.afterKeys.length > MAX_DEDUP_KEYS ||
 						window.afterKeys.some((key) => typeof key !== 'string'))) ||
+				(window.pageToken !== undefined &&
+					(typeof window.pageToken !== 'string' || window.pageToken.length === 0)) ||
+				(window.pageTokenAfterCreated !== undefined &&
+					(!Number.isSafeInteger(window.pageTokenAfterCreated) ||
+						window.pageTokenAfterCreated < 0)) ||
+				(window.pageTokenAfterCreated !== undefined && window.pageToken === undefined) ||
 				(window.afterCreated === undefined) !== (window.afterKeys === undefined) ||
 				(window.partial !== undefined &&
 					(!window.partial ||
@@ -181,7 +196,7 @@ export interface ScanOptions {
 	source: PollSource;
 	manual?: boolean;
 	manualLimit?: number;
-	/** The host enforces a poll budget; without one the key cap fails the poll as it always did. */
+	/** Hosts without a poll budget use shorter windows so long outages still drain in one poll. */
 	budgeted?: boolean;
 }
 export interface ScanResult {
@@ -273,13 +288,14 @@ async function scanWindow(
 		manualLimit = 1,
 		budgeted = false,
 	} = options;
-	// An interrupted window is finished before a new one opens. A new window
-	// spans the full gap, so old issues are searched once rather than once per
-	// fixed-size slice. The overlap catches updates that were indexed late.
+	// An interrupted window is finished before a new one opens. Hosts without a
+	// poll budget cap each window so the key limit cannot strand a long outage.
 	const since = manual ? 0 : Math.max(state!.activation, state!.checkpoint - config.overlapMs);
+	const until =
+		manual || budgeted ? pollStart : Math.min(pollStart, state!.checkpoint + 15 * 60_000);
 	const window: PollWindow = manual
 		? { since, until: pollStart }
-		: (state!.window ?? { since, until: pollStart });
+		: (state!.window ?? { since, until });
 	const lower = window.since;
 	const upper = window.until;
 	const retainFrom = manual ? 0 : Math.max(state!.activation, upper - config.overlapMs);
@@ -312,15 +328,8 @@ async function scanWindow(
 			const eventType = `${config.resource}.${kind}` as PollEvent['eventType'];
 			const key = JSON.stringify([config.resource, issue.id, comment?.id ?? issue.id, kind, time]);
 			if (seen.has(key)) continue;
-			// Under a budget the key cap stops the scan like a spent budget, so a
-			// backlog drains across polls; keys retire as windows close. Without a
-			// budget the poll fails as it always did.
-			if (!manual && seen.size >= MAX_DEDUP_KEYS) {
-				if (budgeted) throw new PollBudgetExhausted('deduplication keys reached the 40,000 limit');
-				throw new Error(
-					'Jira polling deduplication exceeded 40,000 events. Checkpoint unchanged. Narrowing JQL resets from now and abandons the backlog.',
-				);
-			}
+			if (!manual && seen.size >= MAX_DEDUP_KEYS)
+				throw new PollBudgetExhausted('deduplication keys reached the 40,000 limit');
 			seen.set(key, time);
 			events.push({
 				eventType,
@@ -343,6 +352,9 @@ async function scanWindow(
 	};
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
+	let pageToken = window.pageToken;
+	let pageTokenAfterCreated = window.pageTokenAfterCreated;
+	const queryAfterCreated = pageToken === undefined ? afterCreated : pageTokenAfterCreated;
 	let partial = window.partial;
 	let activeIssueId: string | undefined;
 	let current: { issue: Issue; next: number; last: string } | undefined;
@@ -385,6 +397,16 @@ async function scanWindow(
 			afterKeys = [issue.key];
 		}
 	};
+	const alreadyHandledAtMinute = (issue: Issue): boolean => {
+		if (afterCreated === undefined) return false;
+		const created = Date.parse(String(issue.fields.created ?? ''));
+		if (!Number.isFinite(created))
+			throw new Error('Jira returned an invalid issue creation timestamp.');
+		const minute = Math.floor(created / 60_000) * 60_000;
+		return (
+			minute < afterCreated || (minute === afterCreated && Boolean(afterKeys?.includes(issue.key)))
+		);
+	};
 	const dropMissingIssue = (issue: Issue): void => {
 		dropped = issue.id;
 		droppedIssues.set(issue.id, { id: issue.id, through: upper + config.overlapMs });
@@ -412,8 +434,20 @@ async function scanWindow(
 		}
 		for await (const issue of source.issues(
 			lower,
-			manual ? undefined : { afterCreated, afterKeys, createdBefore: upper },
+			manual
+				? undefined
+				: {
+						afterCreated: queryAfterCreated,
+						afterKeys,
+						createdBefore: upper,
+						pageToken,
+						pageProgress: (nextPageToken) => {
+							pageToken = nextPageToken;
+							pageTokenAfterCreated = nextPageToken === undefined ? undefined : queryAfterCreated;
+						},
+					},
 		)) {
+			if (!manual && alreadyHandledAtMinute(issue)) continue;
 			if (!manual && droppedIssues.has(issue.id)) {
 				advancePosition(issue);
 				continue;
@@ -481,10 +515,12 @@ async function scanWindow(
 			events.length > 0 ||
 			afterCreated !== window.afterCreated ||
 			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []) ||
+			pageToken !== window.pageToken ||
+			pageTokenAfterCreated !== window.pageTokenAfterCreated ||
 			mark(partial) !== mark(window.partial);
 	}
-	// Keys retire with their window; the partial issue stays covered if its
-	// comment page is re-read after a budget stop.
+	// During a stopped window, the issue cursor excludes completed issues. Keep
+	// recent overlap keys for the next window and all keys for a partial issue.
 	const keepIssue =
 		stopped !== undefined ? (partial?.issue.id ?? activeIssueId ?? current?.issue.id) : undefined;
 	const priorKeys = new Set(
@@ -507,7 +543,17 @@ async function scanWindow(
 			activation: state!.activation,
 			checkpoint: stopped !== undefined ? state!.checkpoint : upper,
 			...(stopped !== undefined
-				? { window: { since: lower, until: upper, afterCreated, afterKeys, partial } }
+				? {
+						window: {
+							since: lower,
+							until: upper,
+							afterCreated,
+							afterKeys,
+							...(pageToken !== undefined ? { pageToken } : {}),
+							...(pageTokenAfterCreated !== undefined ? { pageTokenAfterCreated } : {}),
+							partial,
+						},
+					}
 				: {}),
 			seen: retained.map(([key, time]) => ({ key, time })),
 			...(droppedIssues.size ? { droppedIssues: [...droppedIssues.values()] } : {}),

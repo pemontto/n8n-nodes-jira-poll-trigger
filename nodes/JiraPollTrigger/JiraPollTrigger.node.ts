@@ -138,13 +138,22 @@ export class JiraPollTrigger implements INodeType {
 						// The poll's catch wraps these as NodeOperationError.
 						// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 						if (error instanceof PollBudgetExhausted) throw error;
-						const { status } = retryDetails(error);
+						const retry = retryDetails(error);
+						const { status } = retry;
 						// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 						if (status !== 401 && status !== 404) throw error;
 						const initialTimeout = Number(request.timeout);
 						const remaining = deadline === undefined ? initialTimeout : deadline - Date.now();
-						// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
-						if (remaining <= 0) throw error;
+						if (remaining <= 0)
+							// scanPoll consumes this sentinel and hands over saved progress.
+							// eslint-disable-next-line @n8n/community-nodes/require-node-api-error, n8n-nodes-base/node-execute-block-wrong-error-thrown
+							throw new PollBudgetExhausted(
+								'OAuth refresh deadline',
+								status,
+								retry.details,
+								retry.code,
+								retry.timedOut,
+							);
 						return await attempt(status, Math.min(initialTimeout, remaining));
 					}
 				};
@@ -163,7 +172,7 @@ export class JiraPollTrigger implements INodeType {
 				const resource = this.getNodeParameter('resource') as PollConfig['resource'];
 				const event = this.getNodeParameter('event') as PollConfig['event'];
 				const jql = String(this.getNodeParameter('jql', '')).trim();
-				buildPollingJql(jql, pollStart);
+				const activationJql = buildPollingJql(jql, pollStart);
 				const manualLimit = Number(options.testLimit ?? 10);
 				if (manual && (!Number.isInteger(manualLimit) || manualLimit < 1 || manualLimit > 100))
 					throw new NodeOperationError(
@@ -199,7 +208,6 @@ export class JiraPollTrigger implements INodeType {
 					resource,
 					event,
 					jql,
-					publicOnly,
 				});
 				const config: PollConfig = {
 					site: new URL(baseUrl).hostname,
@@ -263,12 +271,12 @@ export class JiraPollTrigger implements INodeType {
 				const before = data?.jiraPollState as unknown as PollState | undefined;
 				if (!manual && before?.fingerprint !== fingerprint) {
 					try {
-						await call(
+						await authenticated(
 							`${apiBaseUrl}/rest/api/${simplify && outputFormat === 'wiki' ? 2 : 3}/search/jql`,
 							{
 								method: 'POST',
 								timeout: requestTimeout(deadline),
-								body: { jql, fields: ['created'], maxResults: 1 },
+								body: { jql: activationJql, fields: ['created'], maxResults: 1 },
 							},
 						);
 					} catch (error) {

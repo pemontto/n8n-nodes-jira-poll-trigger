@@ -56,7 +56,6 @@ export function buildPollingJql(
 	lowerBound: number,
 	direction: 'ASC' | 'DESC' = 'ASC',
 	afterCreated?: number,
-	afterKeys?: string[],
 	createdBefore?: number,
 ): string {
 	if (
@@ -65,18 +64,7 @@ export function buildPollingJql(
 		(createdBefore !== undefined && (!Number.isSafeInteger(createdBefore) || createdBefore < 0))
 	)
 		throw new Error('Invalid polling boundary.');
-	if (
-		afterCreated !== undefined &&
-		(!Number.isSafeInteger(afterCreated) || afterCreated < 0 || !afterKeys?.length)
-	)
-		throw new Error('Invalid polling continuation.');
-	if (
-		afterKeys !== undefined &&
-		(!Array.isArray(afterKeys) ||
-			afterKeys.length === 0 ||
-			afterKeys.some((key) => typeof key !== 'string' || !key) ||
-			afterCreated === undefined)
-	)
+	if (afterCreated !== undefined && (!Number.isSafeInteger(afterCreated) || afterCreated < 0))
 		throw new Error('Invalid polling continuation.');
 	let quote = '';
 	let depth = 0;
@@ -102,20 +90,12 @@ export function buildPollingJql(
 	if (/\border\s+by\b/i.test(visible))
 		throw new Error('Remove the top-level ORDER BY clause from JQL.');
 	// Creation time is immutable and Jira compares date bounds at minute
-	// precision. Exclude keys already processed at that minute to resume across
-	// projects without relying on Jira's per-project numeric `id` comparisons.
+	// precision. The poller skips processed keys in code so stale keys are never
+	// sent back to Jira, including keys for issues that are now missing.
 	const bound = `updated >= ${lowerBound}${
 		createdBefore === undefined ? '' : ` AND created <= ${createdBefore}`
-	}${
-		afterCreated === undefined
-			? ''
-			: ` AND (created >= ${afterCreated} AND key NOT IN (${afterKeys!.map(jqlString).join(', ')}))`
-	}`;
+	}${afterCreated === undefined ? '' : ` AND created >= ${afterCreated}`}`;
 	return `${predicate.trim() ? `(${predicate.trim()}) AND ` : ''}${bound} ORDER BY created ${direction}, key ${direction}`;
-}
-
-function jqlString(value: string): string {
-	return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 function httpStatus(value: unknown): number | undefined {
@@ -228,6 +208,9 @@ export class JiraTransport {
 			try {
 				result = await this.read({ ...request, timeout });
 			} catch (error) {
+				// scanPoll consumes this sentinel and hands over saved progress.
+				// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+				if (error instanceof PollBudgetExhausted) throw error;
 				const { status, headers, code, details, transient, timedOut } = retryDetails(error);
 				const known = status !== undefined;
 				const description = details ? ` Jira response: ${details}.` : '';
@@ -312,13 +295,17 @@ export class JiraTransport {
 			lowerBound,
 			limits.direction,
 			limits.afterCreated,
-			limits.afterKeys,
 			limits.createdBefore,
 		);
 		const limit = this.pageLimit(limits);
 		const tokens = new Set<string>();
 		const issueIds = new Set<string>();
-		let nextPageToken: string | undefined;
+		let nextPageToken = limits.pageToken;
+		if (nextPageToken !== undefined) {
+			if (typeof nextPageToken !== 'string' || !nextPageToken)
+				throw new Error('Invalid search continuation.');
+			tokens.add(nextPageToken);
+		}
 		for (let page = 0; page < limit; page++) {
 			const result = await this.request({
 				method: 'POST',
@@ -377,6 +364,7 @@ export class JiraTransport {
 				(tokenReturned && typeof result.isLast === 'boolean' && result.isLast !== isLast)
 			)
 				throw new Error('Jira returned invalid search pagination.');
+			let followingPageToken: string | undefined;
 			if (!isLast) {
 				if (
 					typeof result.nextPageToken !== 'string' ||
@@ -385,8 +373,8 @@ export class JiraTransport {
 					result.issues.length === 0
 				)
 					throw new Error('Jira search pagination did not advance.');
-				nextPageToken = result.nextPageToken;
-				tokens.add(nextPageToken);
+				followingPageToken = result.nextPageToken;
+				tokens.add(followingPageToken);
 			}
 			for (const issue of result.issues) {
 				if (issueIds.has(issue.id as string))
@@ -394,7 +382,9 @@ export class JiraTransport {
 				issueIds.add(issue.id as string);
 				yield issue as Issue;
 			}
+			limits.pageProgress?.(followingPageToken);
 			if (isLast) return;
+			nextPageToken = followingPageToken;
 		}
 	}
 

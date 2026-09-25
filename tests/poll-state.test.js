@@ -279,23 +279,24 @@ test('ordinary restart resumes serialised saved state', async () => {
 	assert.deepEqual(result.events, []);
 	assert.equal(result.state.activation, 1000);
 });
-test('cap fails instead of evicting keys or mutating saved state', async () => {
+test('the key cap hands over a no-budget prefix instead of discarding progress', async () => {
 	const previous = state();
 	const original = structuredClone(previous);
-	await assert.rejects(
-		poll([], {
-			state: previous,
-			source: {
-				async *issues() {
-					yield issue;
-				},
-				async *comments() {
-					for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
-				},
+	const result = await poll([], {
+		state: previous,
+		source: {
+			async *issues() {
+				yield issue;
 			},
-		}),
-		/40,000/,
-	);
+			async *comments() {
+				for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
+			},
+		},
+	});
+	assert.equal(result.events.length, MAX_DEDUP_KEYS);
+	assert.match(result.stopped, /40,000/);
+	assert.equal(result.state.checkpoint, previous.checkpoint);
+	assert.ok(result.state.window.partial);
 	assert.deepEqual(previous, original);
 });
 test('under a budget the cap stops the scan with its progress saved instead of evicting keys or mutating saved state', async () => {
