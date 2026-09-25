@@ -6,7 +6,7 @@
 	"resources": {
 		"primaryDocumentation": [
 			{
-				"url": "https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/"
+				"url": "https://github.com/pemontto/n8n-nodes-jira-poll-trigger#readme"
 			}
 		]
 	}

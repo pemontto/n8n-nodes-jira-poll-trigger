@@ -14,6 +14,8 @@ assert.deepEqual(pkg.n8n.credentials, []);
 for (const entry of pkg.n8n.nodes) assert(files.includes(entry), `Missing ${entry}`);
 assert(files.includes('dist/nodes/JiraPollTrigger/jira.svg'));
 assert(files.includes('dist/nodes/JiraPollTrigger/JiraPollTrigger.node.json'));
+assert(!files.some((file) => file.endsWith('.tsbuildinfo')), 'TypeScript build info must not ship');
+assert(!files.some((file) => file.endsWith('.map')), 'Source maps to local source files must not ship');
 assert(
 	files.every(
 		(file) =>
@@ -22,5 +24,5 @@ assert(
 );
 assert(!files.some((file) => /(?:^|\/)(?:credentials|captures?|snapshots?|node_modules|\.env)(?:\/|$)/i.test(file)));
 console.log(
-	`Package check passed: ${files.length} files; built-in credential reused, no credential definitions or test captures.`,
+	`Package check passed: ${files.length} files; built-in credential reused, no credentials, test captures, build info, or source maps.`,
 );
