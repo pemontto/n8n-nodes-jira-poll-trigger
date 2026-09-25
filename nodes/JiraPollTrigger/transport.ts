@@ -51,23 +51,6 @@ function record(value: unknown): value is JsonRecord {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function compareIssueKeys(left: string, right: string): number {
-	const parts = (key: string) => /^(.*?)-(\d+)$/.exec(key);
-	const a = parts(left);
-	const b = parts(right);
-	if (a && b) return a[1].localeCompare(b[1]) || Number(a[2]) - Number(b[2]);
-	return left.localeCompare(right);
-}
-
-function compareIssuePosition(
-	leftCreated: number,
-	leftKey: string,
-	rightCreated: number,
-	rightKey: string,
-): number {
-	return leftCreated - rightCreated || compareIssueKeys(leftKey, rightKey);
-}
-
 /** Keep quoted strings intact while checking the top-level predicate. */
 export function buildPollingJql(
 	predicate: string,
@@ -318,8 +301,8 @@ export class JiraTransport {
 		);
 		const limit = this.pageLimit(limits);
 		const path = `/rest/api/${this.apiVersion}/search/jql`;
-		const searchBody = (pageToken?: string): JsonRecord => ({
-			jql,
+		const searchBody = (pageToken?: string, searchJql = jql): JsonRecord => ({
+			jql: searchJql,
 			fields: [
 				...new Set([
 					'created',
@@ -333,9 +316,9 @@ export class JiraTransport {
 			maxResults: 100,
 			...(pageToken ? { nextPageToken: pageToken } : {}),
 		});
-		const requestKey = () =>
+		const requestKey = (searchJql = jql) =>
 			createHash('sha256')
-				.update(JSON.stringify({ path, body: searchBody() }))
+				.update(JSON.stringify({ path, body: searchBody(undefined, searchJql) }))
 				.digest('hex');
 		const tokens = new Set<string>();
 		const issueIds = new Set<string>();
@@ -357,14 +340,21 @@ export class JiraTransport {
 				throw new Error('Jira returned invalid issues.');
 			return result.issues as Issue[];
 		};
-		const requestPage = (pageToken?: string) =>
+		const requestPage = (pageToken?: string, searchJql = jql) =>
 			this.request({
 				method: 'POST',
 				path,
-				body: searchBody(pageToken),
+				body: searchBody(pageToken, searchJql),
 			});
+		let savedPageRequested = limits.resumeWithPageToken === true || nextPageToken !== undefined;
+		if (
+			limits.resumeWithPageToken === true &&
+			(limits.pageTokenLastKey === undefined || limits.pageTokenRequestKey === undefined)
+		)
+			throw new Error('Invalid saved search page resume.');
 		const discardSavedPage = (reason: 'request-mismatch' | 'rejected' | 'position-mismatch') => {
 			limits.pageTokenFallback?.(reason);
+			savedPageRequested = false;
 			nextPageToken = undefined;
 			tokens.clear();
 			issueIds.clear();
@@ -378,7 +368,7 @@ export class JiraTransport {
 			);
 		};
 		if (
-			nextPageToken !== undefined &&
+			savedPageRequested &&
 			limits.pageTokenRequestKey !== undefined &&
 			limits.pageTokenRequestKey !== requestKey()
 		)
@@ -390,7 +380,7 @@ export class JiraTransport {
 		}
 		for (let page = 0; page < limit; page++) {
 			let requestPageToken = nextPageToken;
-			let validateSavedPageToken = requestPageToken !== undefined;
+			let validateSavedPageToken = page === 0 && savedPageRequested;
 			let result: JsonRecord;
 			try {
 				result = await requestPage(requestPageToken);
@@ -413,30 +403,21 @@ export class JiraTransport {
 				result = await requestPage();
 			}
 			let pageIssues = validateIssues(result);
-			if (
-				page === 0 &&
-				validateSavedPageToken &&
-				limits.pageTokenLastKey !== undefined &&
-				!(
-					pageIssues.length === 0 ||
-					(limits.pageTokenContinuesAfterLastKey === true &&
-						limits.pageTokenLastCreated !== undefined &&
-						Number.isFinite(Date.parse(pageIssues[0].fields.created ?? '')) &&
-						compareIssuePosition(
-							Date.parse(pageIssues[0].fields.created ?? ''),
-							pageIssues[0].key,
-							limits.pageTokenLastCreated,
-							limits.pageTokenLastKey,
-						) > 0) ||
-					(limits.pageTokenContinuesAfterLastKey !== true &&
-						pageIssues.some((issue) => issue.key === limits.pageTokenLastKey))
-				)
-			) {
-				discardSavedPage('position-mismatch');
-				requestPageToken = undefined;
-				validateSavedPageToken = false;
-				result = await requestPage();
-				pageIssues = validateIssues(result);
+			let savedBoundaryIndex = -1;
+			if (validateSavedPageToken && limits.pageTokenLastKey !== undefined) {
+				savedBoundaryIndex = pageIssues.findIndex((issue) => {
+					if (issue.key !== limits.pageTokenLastKey) return false;
+					if (limits.pageTokenLastCreated === undefined) return true;
+					const created = Date.parse(issue.fields.created ?? '');
+					return Number.isFinite(created) && created === limits.pageTokenLastCreated;
+				});
+				if (savedBoundaryIndex < 0) {
+					discardSavedPage('position-mismatch');
+					requestPageToken = undefined;
+					validateSavedPageToken = false;
+					result = await requestPage();
+					pageIssues = validateIssues(result);
+				} else limits.pageTokenResume?.();
 			}
 			const warningValues = [result.warnings, result.warningMessages].filter(
 				(value) => value !== undefined,
@@ -474,7 +455,11 @@ export class JiraTransport {
 				followingPageToken = result.nextPageToken;
 				tokens.add(followingPageToken);
 			}
-			for (const issue of pageIssues) {
+			const pageIssuesAfterSavedPosition =
+				page === 0 && validateSavedPageToken
+					? pageIssues.slice(savedBoundaryIndex + 1)
+					: pageIssues;
+			for (const issue of pageIssuesAfterSavedPosition) {
 				if (issueIds.has(issue.id as string))
 					throw new Error('Jira search repeated an issue across pages. Retry the poll.');
 				issueIds.add(issue.id as string);
@@ -483,10 +468,19 @@ export class JiraTransport {
 			const lastIssue = pageIssues.at(-1);
 			limits.pageProgress?.(
 				requestPageToken,
-				isLast ? undefined : followingPageToken,
 				lastIssue?.key,
 				lastIssue ? Date.parse(lastIssue.fields.created ?? '') : undefined,
-				requestKey(),
+				lastIssue && requestPageToken === undefined
+					? requestKey(
+							buildPollingJql(
+								predicate,
+								lowerBound,
+								limits.direction,
+								Math.floor(Date.parse(lastIssue.fields.created ?? '') / 60_000) * 60_000,
+								limits.createdBefore,
+							),
+						)
+					: requestKey(),
 			);
 			if (isLast) return;
 			nextPageToken = followingPageToken;

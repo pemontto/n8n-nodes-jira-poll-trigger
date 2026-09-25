@@ -171,6 +171,76 @@ test('search follows tokens and requests timestamps and rendered descriptions on
 	}
 	assert.equal(calls[1].body.nextPageToken, 'next');
 });
+test('a tokenless page replay verifies its request digest and last issue before continuing', async () => {
+	const minute = Date.parse('2026-01-01T00:00:00Z');
+	let savedPage;
+	const initial = new JiraTransport(async (request) =>
+		request.body.nextPageToken
+			? { issues: [issue('2')], isLast: true }
+			: { issues: [issue('1')], isLast: false, nextPageToken: 'next' },
+	);
+	assert.deepEqual(
+		await collect(
+			initial.searchIssues('', minute, [], {
+				createdBefore: minute + 60_000,
+				pageProgress: (requestToken, key, created, requestKey) => {
+					if (requestToken === undefined) savedPage = { key, created, requestKey };
+				},
+			}),
+		),
+		[issue('1'), issue('2')],
+	);
+	assert(savedPage);
+	const calls = [];
+	let resumed = false;
+	const fallbacks = [];
+	const replay = new JiraTransport(async (request) => {
+		calls.push(request);
+		return request.body.nextPageToken
+			? { issues: [issue('2')], isLast: true }
+			: { issues: [issue('1')], isLast: false, nextPageToken: 'next' };
+	});
+	assert.deepEqual(
+		(
+			await collect(
+				replay.searchIssues('', minute, [], {
+					afterCreated: minute,
+					createdBefore: minute + 60_000,
+					resumeWithPageToken: true,
+					pageTokenLastKey: savedPage.key,
+					pageTokenLastCreated: savedPage.created,
+					pageTokenRequestKey: savedPage.requestKey,
+					fallbackAfterCreated: minute,
+					pageTokenResume: () => {
+						resumed = true;
+					},
+					pageTokenFallback: (reason) => fallbacks.push(reason),
+				}),
+			)
+		).map((item) => item.id),
+		['2'],
+	);
+	assert.equal(resumed, true);
+	assert.deepEqual(fallbacks, []);
+	assert.equal(calls[0].body.nextPageToken, undefined);
+	assert.match(calls[0].body.jql, new RegExp(`created >= ${minute}`));
+	assert.equal(calls[1].body.nextPageToken, 'next');
+
+	const changedDigest = new JiraTransport(async () => ({ issues: [], isLast: true }));
+	await collect(
+		changedDigest.searchIssues('', minute, [], {
+			afterCreated: minute,
+			createdBefore: minute + 60_000,
+			resumeWithPageToken: true,
+			pageTokenLastKey: savedPage.key,
+			pageTokenLastCreated: savedPage.created,
+			pageTokenRequestKey: 'different-request',
+			fallbackAfterCreated: minute,
+			pageTokenFallback: (reason) => fallbacks.push(reason),
+		}),
+	);
+	assert.deepEqual(fallbacks, ['request-mismatch']);
+});
 test('only expired or inconsistent page tokens fall back to the minute query', async () => {
 	for (const status of [400, 404, 410]) {
 		const calls = [];

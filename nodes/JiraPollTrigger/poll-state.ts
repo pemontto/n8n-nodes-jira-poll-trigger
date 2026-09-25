@@ -38,7 +38,7 @@ export interface PollWindow {
 	afterCreated?: number;
 	/** Issue keys already processed at afterCreated. */
 	afterKeys?: string[];
-	/** Jira token used to resume the last consumed page or its successor. */
+	/** Jira token used to re-read the last consumed page; undefined means its first page. */
 	pageToken?: string;
 	/** Creation bound used by the query that produced `pageToken`. */
 	pageTokenAfterCreated?: number;
@@ -46,11 +46,9 @@ export interface PollWindow {
 	pageTokenLastKey?: string;
 	/** Creation time of the issue used to validate the saved token's position. */
 	pageTokenLastCreated?: number;
-	/** Whether `pageToken` selects the page after `pageTokenLastKey`. */
-	pageTokenContinuesAfterLastKey?: boolean;
 	/** Digest of the request that produced the token, excluding the token itself. */
 	pageTokenRequestKey?: string;
-	/** Whether the saved page token is eligible for token-first resume. */
+	/** Whether to re-read the saved page; a missing token identifies the first page. */
 	resumeWithPageToken?: boolean;
 	/**
 	 * Issue whose comments are outstanding: its search payload, the first unread
@@ -81,26 +79,26 @@ export interface SearchReadOptions {
 	/** Resume at this creation minute; `afterKeys` are skipped by the scanner. */
 	afterCreated?: number;
 	afterKeys?: string[];
-	/** Resume this Jira search at its saved page or continuation. */
+	/** Re-read the saved Jira search page; a missing token identifies the first page. */
 	pageToken?: string;
+	resumeWithPageToken?: boolean;
 	/** Issue key used to validate the saved token's position. */
 	pageTokenLastKey?: string;
 	/** Creation time of the issue used to validate the saved token's position. */
 	pageTokenLastCreated?: number;
-	/** Whether `pageToken` selects the page after `pageTokenLastKey`. */
-	pageTokenContinuesAfterLastKey?: boolean;
 	/** Digest expected for the request that produced this token. */
 	pageTokenRequestKey?: string;
 	/** Creation cursor used if a saved page token is rejected or inconsistent. */
 	fallbackAfterCreated?: number;
-	/** Called after every fully consumed issue page with its continuation and last position. */
+	/** Called after every fully consumed issue page with its request token and last position. */
 	pageProgress?: (
 		requestPageToken: string | undefined,
-		pageToken: string | undefined,
 		lastIssueKey: string | undefined,
 		lastIssueCreated: number | undefined,
 		pageTokenRequestKey: string,
 	) => void;
+	/** Called after a saved page passed its request and position checks. */
+	pageTokenResume?: () => void;
 	/** Called before a saved page token is discarded and the creation-minute query restarts. */
 	pageTokenFallback?: (reason: 'request-mismatch' | 'rejected' | 'position-mismatch') => void;
 	/** Return only issues created at or before this epoch millisecond. */
@@ -205,32 +203,24 @@ function validateState(state: PollState): void {
 					(typeof window.pageToken !== 'string' || window.pageToken.length === 0)) ||
 				(window.pageTokenAfterCreated !== undefined &&
 					(!Number.isSafeInteger(window.pageTokenAfterCreated) ||
-						window.pageTokenAfterCreated < 0)) ||
-				(window.pageTokenAfterCreated !== undefined && window.pageToken === undefined) ||
+						window.pageTokenAfterCreated < 0 ||
+						(window.pageToken === undefined && window.resumeWithPageToken !== true))) ||
 				(window.pageTokenLastKey !== undefined &&
 					(typeof window.pageTokenLastKey !== 'string' ||
 						window.pageTokenLastKey.length === 0 ||
-						window.pageToken === undefined)) ||
+						(window.pageToken === undefined && window.resumeWithPageToken !== true))) ||
 				(window.pageTokenLastCreated !== undefined &&
 					(!Number.isSafeInteger(window.pageTokenLastCreated) ||
 						window.pageTokenLastCreated < 0 ||
-						window.pageToken === undefined)) ||
-				(window.pageTokenContinuesAfterLastKey !== undefined &&
-					(typeof window.pageTokenContinuesAfterLastKey !== 'boolean' ||
-						window.pageToken === undefined ||
-						(window.pageTokenContinuesAfterLastKey &&
-							(window.pageTokenLastCreated === undefined ||
-								window.pageTokenLastKey === undefined ||
-								window.pageToken === undefined)))) ||
+						(window.pageToken === undefined && window.resumeWithPageToken !== true))) ||
 				(window.pageTokenRequestKey !== undefined &&
 					(typeof window.pageTokenRequestKey !== 'string' ||
 						window.pageTokenRequestKey.length === 0 ||
-						window.pageToken === undefined)) ||
+						(window.pageToken === undefined && window.resumeWithPageToken !== true))) ||
 				(window.resumeWithPageToken !== undefined &&
 					(typeof window.resumeWithPageToken !== 'boolean' ||
 						(window.resumeWithPageToken &&
-							(window.pageToken === undefined ||
-								window.pageTokenLastKey === undefined ||
+							(window.pageTokenLastKey === undefined ||
 								window.pageTokenRequestKey === undefined)))) ||
 				(window.afterCreated === undefined) !== (window.afterKeys === undefined) ||
 				(window.partial !== undefined &&
@@ -275,6 +265,9 @@ export interface ScanResult {
 	stopped?: string;
 	stopError?: JiraReadError;
 	pageTokenReplayBlocked?: boolean;
+	pageTokenFallbackReason?: 'request-mismatch' | 'rejected' | 'position-mismatch';
+	savedPageReplayed?: boolean;
+	budgetExhausted?: boolean;
 	/** ID of a partly read issue that was dropped because Jira no longer serves it. */
 	dropped?: string;
 }
@@ -423,26 +416,18 @@ async function scanWindow(
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
 	let resumeWithPageToken =
-		window.pageToken !== undefined &&
+		(window.resumeWithPageToken === true || window.pageToken !== undefined) &&
 		window.pageTokenLastKey !== undefined &&
 		window.pageTokenRequestKey !== undefined;
 	let pageToken = resumeWithPageToken ? window.pageToken : undefined;
-	const pageTokenAtWindowStart = pageToken;
-	let savedPageTokenRejected = window.pageToken !== undefined && !resumeWithPageToken;
 	let pageTokenAfterCreated = resumeWithPageToken ? window.pageTokenAfterCreated : undefined;
 	let pageTokenLastKey = resumeWithPageToken ? window.pageTokenLastKey : undefined;
 	let pageTokenLastCreated = resumeWithPageToken ? window.pageTokenLastCreated : undefined;
-	let pageTokenContinuesAfterLastKey = resumeWithPageToken
-		? window.pageTokenContinuesAfterLastKey
-		: undefined;
 	let pageTokenRequestKey = resumeWithPageToken ? window.pageTokenRequestKey : undefined;
 	let queryAfterCreated = resumeWithPageToken ? pageTokenAfterCreated : afterCreated;
-	let replayBoundary: { key: string; created?: number } | undefined =
-		!resumeWithPageToken && window.pageToken !== undefined && window.pageTokenLastKey !== undefined
-			? { key: window.pageTokenLastKey, created: window.pageTokenLastCreated }
-			: undefined;
-	let pageTokenRejected = replayBoundary !== undefined;
-	let replayPassedBoundary = false;
+	let pageTokenReplayBlocked = false;
+	let pageTokenFallbackReason: ScanResult['pageTokenFallbackReason'];
+	let savedPageReplayed = false;
 	let partial = window.partial;
 	let activeIssueId: string | undefined;
 	let current: { issue: Issue; next: number; last: string } | undefined;
@@ -504,6 +489,7 @@ async function scanWindow(
 		activeIssueId = undefined;
 	};
 	let stopError: JiraReadError | undefined;
+	let budgetExhausted = false;
 	try {
 		// Finish the outstanding issue before searching: the search that found it
 		// may not fit in the budget alongside its comments.
@@ -531,67 +517,38 @@ async function scanWindow(
 						pageToken,
 						pageTokenLastKey,
 						pageTokenLastCreated,
-						pageTokenContinuesAfterLastKey,
 						pageTokenRequestKey,
+						resumeWithPageToken,
 						fallbackAfterCreated: afterCreated,
 						pageTokenFallback: (reason) => {
-							if (pageToken !== undefined && pageTokenLastKey !== undefined) {
-								replayBoundary = { key: pageTokenLastKey, created: pageTokenLastCreated };
-								pageTokenRejected = reason !== 'request-mismatch';
-								replayPassedBoundary = false;
-							}
-							savedPageTokenRejected = true;
+							pageTokenReplayBlocked = true;
+							pageTokenFallbackReason = reason;
 							pageToken = undefined;
 							pageTokenAfterCreated = undefined;
 							pageTokenLastKey = undefined;
 							pageTokenLastCreated = undefined;
-							pageTokenContinuesAfterLastKey = undefined;
 							pageTokenRequestKey = undefined;
 							resumeWithPageToken = false;
 							queryAfterCreated = afterCreated;
 						},
-						pageProgress: (
-							requestPageToken,
-							continuationToken,
-							lastIssueKey,
-							lastIssueCreated,
-							requestKey,
-						) => {
-							if (replayBoundary !== undefined && !replayPassedBoundary) return;
-							const consumedSavedToken =
-								!savedPageTokenRejected &&
-								pageTokenAtWindowStart !== undefined &&
-								requestPageToken === pageTokenAtWindowStart;
-							const currentPageToken =
-								continuationToken === undefined
+						pageTokenResume: () => {
+							savedPageReplayed = true;
+						},
+						pageProgress: (requestPageToken, lastIssueKey, lastIssueCreated, requestKey) => {
+							pageToken = lastIssueKey === undefined ? undefined : requestPageToken;
+							pageTokenAfterCreated =
+								lastIssueKey === undefined
 									? undefined
-									: requestPageToken !== undefined && !consumedSavedToken
-										? requestPageToken
-										: continuationToken;
-							pageToken = lastIssueKey === undefined ? undefined : currentPageToken;
-							pageTokenAfterCreated = pageToken === undefined ? undefined : queryAfterCreated;
-							pageTokenLastKey = pageToken === undefined ? undefined : lastIssueKey;
-							pageTokenLastCreated = pageToken === undefined ? undefined : lastIssueCreated;
-							pageTokenContinuesAfterLastKey =
-								pageToken === undefined
-									? undefined
-									: requestPageToken === undefined || consumedSavedToken;
-							pageTokenRequestKey = pageToken === undefined ? undefined : requestKey;
+									: requestPageToken === undefined && lastIssueCreated !== undefined
+										? Math.floor(lastIssueCreated / 60_000) * 60_000
+										: queryAfterCreated;
+							pageTokenLastKey = lastIssueKey;
+							pageTokenLastCreated = lastIssueCreated;
+							pageTokenRequestKey = lastIssueKey === undefined ? undefined : requestKey;
+							resumeWithPageToken = lastIssueKey !== undefined;
 						},
 					},
 		)) {
-			if (!manual && replayBoundary !== undefined && !replayPassedBoundary) {
-				const created = Date.parse(String(issue.fields.created ?? ''));
-				replayPassedBoundary =
-					replayBoundary.created !== undefined && Number.isFinite(created)
-						? compareIssuePosition(
-								created,
-								issue.key,
-								replayBoundary.created,
-								replayBoundary.key,
-							) >= 0
-						: issue.key === replayBoundary.key;
-			}
 			if (!manual && alreadyHandledAtMinute(issue)) continue;
 			if (!manual && droppedIssues.has(issue.id)) {
 				advancePosition(issue);
@@ -625,6 +582,7 @@ async function scanWindow(
 		// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 		if (manual) throw error;
 		if (error instanceof PollBudgetExhausted) {
+			budgetExhausted = true;
 			stopped = error.reason;
 			if (error.status !== undefined || error.timedOut)
 				stopError = new JiraReadError(error.message, error.status, {
@@ -661,10 +619,7 @@ async function scanWindow(
 		const positionAdvanced =
 			afterCreated !== window.afterCreated ||
 			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []);
-		resumeWithPageToken =
-			pageToken !== undefined &&
-			pageTokenLastKey !== undefined &&
-			pageTokenRequestKey !== undefined;
+		resumeWithPageToken = pageTokenLastKey !== undefined && pageTokenRequestKey !== undefined;
 		const pageTokenPositionAdvanced =
 			pageTokenLastKey !== undefined &&
 			(window.pageTokenLastKey === undefined ||
@@ -698,7 +653,10 @@ async function scanWindow(
 		events,
 		stopped,
 		stopError,
-		pageTokenReplayBlocked: pageTokenRejected,
+		pageTokenReplayBlocked,
+		pageTokenFallbackReason,
+		savedPageReplayed,
+		budgetExhausted,
 		dropped,
 		advanced,
 		state: {
@@ -717,9 +675,6 @@ async function scanWindow(
 							...(pageTokenAfterCreated !== undefined ? { pageTokenAfterCreated } : {}),
 							...(pageTokenLastKey !== undefined ? { pageTokenLastKey } : {}),
 							...(pageTokenLastCreated !== undefined ? { pageTokenLastCreated } : {}),
-							...(pageTokenContinuesAfterLastKey !== undefined
-								? { pageTokenContinuesAfterLastKey }
-								: {}),
 							...(pageTokenRequestKey !== undefined ? { pageTokenRequestKey } : {}),
 							...(resumeWithPageToken ? { resumeWithPageToken: true } : {}),
 							partial,
@@ -741,18 +696,28 @@ function noProgressError(
 	const window = result.state.window;
 	const position = window ? `window [${window.since}, ${window.until}]` : 'no open window';
 	const prefix = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, ${position}`;
-	if (result.pageTokenReplayBlocked) {
-		const recovery =
-			"more issues were created in one minute than a poll can replay and Jira's page token did not survive. Narrow the JQL to reduce the issues created in that minute, then reset the trigger from now.";
-		if (result.stopError instanceof JiraReadError && result.stopError.status !== undefined)
-			return new JiraReadError(`${prefix}: ${recovery}`, result.stopError.status, {
-				details: result.stopError.details,
-				code: result.stopError.code,
-				transient: result.stopError.transient,
-				timedOut: result.stopError.timedOut,
-			});
-		return new Error(`${prefix}: ${recovery}`);
+	if (result.stopError instanceof JiraReadError && result.stopError.status !== undefined)
+		return new JiraReadError(`${prefix}: ${reason}`, result.stopError.status, {
+			details: result.stopError.details,
+			code: result.stopError.code,
+			transient: result.stopError.transient,
+			timedOut: result.stopError.timedOut,
+		});
+	if (result.budgetExhausted && result.pageTokenReplayBlocked) {
+		const fallback =
+			result.pageTokenFallbackReason === 'position-mismatch'
+				? "Jira's saved page token no longer points to the page containing the last handled issue."
+				: result.pageTokenFallbackReason === 'request-mismatch'
+					? 'The saved Jira page request no longer matches its request digest.'
+					: 'Jira rejected the saved page token.';
+		return new Error(
+			`${prefix}: ${fallback} The fallback minute query used the poll budget without reaching new work. Increase the poll budget or narrow the JQL.`,
+		);
 	}
+	if (result.budgetExhausted && result.savedPageReplayed)
+		return new Error(
+			`${prefix}: the poll budget ended after re-reading the last Jira search page and before reaching the next page. A budget that can read only one search page cannot advance this backlog; increase the poll budget or narrow the JQL.`,
+		);
 	if (result.stopError instanceof JiraReadError)
 		return new JiraReadError(`${prefix}: ${reason}`, result.stopError.status, {
 			details: result.stopError.details,
