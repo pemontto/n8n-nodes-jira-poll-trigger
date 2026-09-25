@@ -38,10 +38,16 @@ export interface PollWindow {
 	afterCreated?: number;
 	/** Issue keys already processed at afterCreated. */
 	afterKeys?: string[];
-	/** Jira's opaque next-page token for the open search window. */
+	/** Jira page token for the last fully consumed page of an open search. */
 	pageToken?: string;
 	/** Creation bound used by the query that produced `pageToken`. */
 	pageTokenAfterCreated?: number;
+	/** Last key in the page selected by `pageToken`, used to validate its position. */
+	pageTokenLastKey?: string;
+	/** Digest of the request that produced the token, excluding the token itself. */
+	pageTokenRequestKey?: string;
+	/** Use the saved page token only after replaying the minute query made no progress. */
+	resumeWithPageToken?: boolean;
 	/**
 	 * Issue whose comments are outstanding: its search payload, the first unread
 	 * offset, the comment before that offset, and whether it was finished ahead
@@ -71,10 +77,22 @@ export interface SearchReadOptions {
 	/** Resume at this creation minute; `afterKeys` are skipped by the scanner. */
 	afterCreated?: number;
 	afterKeys?: string[];
-	/** Resume from this Jira search page after a poll stop. */
+	/** Re-read this Jira page only when the minute query could not make progress. */
 	pageToken?: string;
-	/** Called after every fully consumed issue page. */
-	pageProgress?: (nextPageToken: string | undefined) => void;
+	/** Last key expected on the page selected by `pageToken`. */
+	pageTokenLastKey?: string;
+	/** Digest expected for the request that produced this token. */
+	pageTokenRequestKey?: string;
+	/** Creation cursor used if a saved page token is rejected or inconsistent. */
+	fallbackAfterCreated?: number;
+	/** Called after every fully consumed issue page with its token, last key and request digest. */
+	pageProgress?: (
+		pageToken: string | undefined,
+		lastIssueKey: string | undefined,
+		pageTokenRequestKey: string,
+	) => void;
+	/** Called before a saved page token is discarded and the creation-minute query restarts. */
+	pageTokenFallback?: () => void;
 	/** Return only issues created at or before this epoch millisecond. */
 	createdBefore?: number;
 }
@@ -162,6 +180,20 @@ function validateState(state: PollState): void {
 					(!Number.isSafeInteger(window.pageTokenAfterCreated) ||
 						window.pageTokenAfterCreated < 0)) ||
 				(window.pageTokenAfterCreated !== undefined && window.pageToken === undefined) ||
+				(window.pageTokenLastKey !== undefined &&
+					(typeof window.pageTokenLastKey !== 'string' ||
+						window.pageTokenLastKey.length === 0 ||
+						window.pageToken === undefined)) ||
+				(window.pageTokenRequestKey !== undefined &&
+					(typeof window.pageTokenRequestKey !== 'string' ||
+						window.pageTokenRequestKey.length === 0 ||
+						window.pageToken === undefined)) ||
+				(window.resumeWithPageToken !== undefined &&
+					(typeof window.resumeWithPageToken !== 'boolean' ||
+						(window.resumeWithPageToken &&
+							(window.pageToken === undefined ||
+								window.pageTokenLastKey === undefined ||
+								window.pageTokenRequestKey === undefined)))) ||
 				(window.afterCreated === undefined) !== (window.afterKeys === undefined) ||
 				(window.partial !== undefined &&
 					(!window.partial ||
@@ -196,7 +228,7 @@ export interface ScanOptions {
 	source: PollSource;
 	manual?: boolean;
 	manualLimit?: number;
-	/** Hosts without a poll budget use shorter windows so long outages still drain in one poll. */
+	/** Whether the host has a poll budget, for budget-aware transient read handling. */
 	budgeted?: boolean;
 }
 export interface ScanResult {
@@ -288,11 +320,10 @@ async function scanWindow(
 		manualLimit = 1,
 		budgeted = false,
 	} = options;
-	// An interrupted window is finished before a new one opens. Hosts without a
-	// poll budget cap each window so the key limit cannot strand a long outage.
+	// An interrupted window is finished before a new one opens. Both host types
+	// scan one interval; hosts without a budget stop only at the key cap.
 	const since = manual ? 0 : Math.max(state!.activation, state!.checkpoint - config.overlapMs);
-	const until =
-		manual || budgeted ? pollStart : Math.min(pollStart, state!.checkpoint + 15 * 60_000);
+	const until = pollStart;
 	const window: PollWindow = manual
 		? { since, until: pollStart }
 		: (state!.window ?? { since, until });
@@ -352,9 +383,15 @@ async function scanWindow(
 	};
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
-	let pageToken = window.pageToken;
-	let pageTokenAfterCreated = window.pageTokenAfterCreated;
-	const queryAfterCreated = pageToken === undefined ? afterCreated : pageTokenAfterCreated;
+	let resumeWithPageToken =
+		window.resumeWithPageToken === true &&
+		window.pageToken !== undefined &&
+		window.pageTokenLastKey !== undefined;
+	let pageToken = resumeWithPageToken ? window.pageToken : undefined;
+	let pageTokenAfterCreated = resumeWithPageToken ? window.pageTokenAfterCreated : undefined;
+	let pageTokenLastKey = resumeWithPageToken ? window.pageTokenLastKey : undefined;
+	let pageTokenRequestKey = resumeWithPageToken ? window.pageTokenRequestKey : undefined;
+	let queryAfterCreated = resumeWithPageToken ? pageTokenAfterCreated : afterCreated;
 	let partial = window.partial;
 	let activeIssueId: string | undefined;
 	let current: { issue: Issue; next: number; last: string } | undefined;
@@ -441,9 +478,22 @@ async function scanWindow(
 						afterKeys,
 						createdBefore: upper,
 						pageToken,
-						pageProgress: (nextPageToken) => {
-							pageToken = nextPageToken;
-							pageTokenAfterCreated = nextPageToken === undefined ? undefined : queryAfterCreated;
+						pageTokenLastKey,
+						pageTokenRequestKey,
+						fallbackAfterCreated: afterCreated,
+						pageTokenFallback: () => {
+							pageToken = undefined;
+							pageTokenAfterCreated = undefined;
+							pageTokenLastKey = undefined;
+							pageTokenRequestKey = undefined;
+							resumeWithPageToken = false;
+							queryAfterCreated = afterCreated;
+						},
+						pageProgress: (consumedPageToken, lastIssueKey, requestKey) => {
+							pageToken = lastIssueKey === undefined ? undefined : consumedPageToken;
+							pageTokenAfterCreated = pageToken === undefined ? undefined : queryAfterCreated;
+							pageTokenLastKey = pageToken === undefined ? undefined : lastIssueKey;
+							pageTokenRequestKey = pageToken === undefined ? undefined : requestKey;
 						},
 					},
 		)) {
@@ -491,6 +541,8 @@ async function scanWindow(
 		} else if (budgeted && error instanceof JiraReadError && (error.transient || error.timedOut)) {
 			stopped = error.message;
 			stopError = error;
+		} else if (error instanceof JiraReadError && state?.window !== undefined) {
+			throw positionedError(error, config, state, lower, upper);
 		} else if (isPaginationProgressError(error)) {
 			throw positionedError(error, config, state!, lower, upper);
 		} else {
@@ -511,12 +563,20 @@ async function scanWindow(
 			};
 		const mark = (value: PollWindow['partial']) =>
 			value ? [value.issue.id, value.startAt, value.lastCommentId, value.done].join('/') : '';
+		const positionAdvanced =
+			afterCreated !== window.afterCreated ||
+			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []);
+		resumeWithPageToken = positionAdvanced
+			? false
+			: pageToken !== undefined && pageTokenLastKey !== undefined;
 		advanced =
 			events.length > 0 ||
-			afterCreated !== window.afterCreated ||
-			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []) ||
+			positionAdvanced ||
 			pageToken !== window.pageToken ||
 			pageTokenAfterCreated !== window.pageTokenAfterCreated ||
+			pageTokenLastKey !== window.pageTokenLastKey ||
+			pageTokenRequestKey !== window.pageTokenRequestKey ||
+			resumeWithPageToken !== (window.resumeWithPageToken ?? false) ||
 			mark(partial) !== mark(window.partial);
 	}
 	// During a stopped window, the issue cursor excludes completed issues. Keep
@@ -551,6 +611,9 @@ async function scanWindow(
 							afterKeys,
 							...(pageToken !== undefined ? { pageToken } : {}),
 							...(pageTokenAfterCreated !== undefined ? { pageTokenAfterCreated } : {}),
+							...(pageTokenLastKey !== undefined ? { pageTokenLastKey } : {}),
+							...(pageTokenRequestKey !== undefined ? { pageTokenRequestKey } : {}),
+							...(resumeWithPageToken ? { resumeWithPageToken: true } : {}),
 							partial,
 						},
 					}
@@ -597,9 +660,16 @@ function positionedError(
 ): Error {
 	const message =
 		error instanceof Error ? error.message : 'Jira pagination failed without an error message';
-	return new Error(
-		`Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, window [${lower}, ${upper}]: ${message}`,
-	);
+	const positioned = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, window [${lower}, ${upper}]: ${message}`;
+	if (error instanceof JiraReadError)
+		return new JiraReadError(positioned, error.status, {
+			details: error.details,
+			code: error.code,
+			transient: error.transient,
+			timedOut: error.timedOut,
+			issueMissing: error.issueMissing,
+		});
+	return new Error(positioned);
 }
 
 /** Embedded comments are re-read on resume, so the saved payload leaves them out. */

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { sleep } from 'n8n-workflow';
 import {
 	JiraReadError,
@@ -290,52 +291,39 @@ export class JiraTransport {
 		fields: string[],
 		limits: SearchOptions = {},
 	): AsyncGenerator<Issue> {
-		const jql = buildPollingJql(
+		let afterCreated = limits.afterCreated;
+		let jql = buildPollingJql(
 			predicate,
 			lowerBound,
 			limits.direction,
-			limits.afterCreated,
+			afterCreated,
 			limits.createdBefore,
 		);
 		const limit = this.pageLimit(limits);
+		const path = `/rest/api/${this.apiVersion}/search/jql`;
+		const searchBody = (pageToken?: string): JsonRecord => ({
+			jql,
+			fields: [
+				...new Set([
+					'created',
+					'updated',
+					'project',
+					...fields,
+					...(limits.withComments ? ['comment'] : []),
+				]),
+			],
+			expand: 'renderedFields',
+			maxResults: 100,
+			...(pageToken ? { nextPageToken: pageToken } : {}),
+		});
+		const requestKey = () =>
+			createHash('sha256')
+				.update(JSON.stringify({ path, body: searchBody() }))
+				.digest('hex');
 		const tokens = new Set<string>();
 		const issueIds = new Set<string>();
 		let nextPageToken = limits.pageToken;
-		if (nextPageToken !== undefined) {
-			if (typeof nextPageToken !== 'string' || !nextPageToken)
-				throw new Error('Invalid search continuation.');
-			tokens.add(nextPageToken);
-		}
-		for (let page = 0; page < limit; page++) {
-			const result = await this.request({
-				method: 'POST',
-				path: `/rest/api/${this.apiVersion}/search/jql`,
-				body: {
-					jql,
-					fields: [
-						...new Set([
-							'created',
-							'updated',
-							'project',
-							...fields,
-							...(limits.withComments ? ['comment'] : []),
-						]),
-					],
-					expand: 'renderedFields',
-					maxResults: 100,
-					...(nextPageToken ? { nextPageToken } : {}),
-				},
-			});
-			const warningValues = [result.warnings, result.warningMessages].filter(
-				(value) => value !== undefined,
-			);
-			if (
-				warningValues.some((value) => !Array.isArray(value)) ||
-				warningValues.some((value) => Array.isArray(value) && value.length > 0)
-			)
-				throw new Error(
-					'Jira search returned warnings and may be incomplete. Narrow the JQL before retrying.',
-				);
+		const validateIssues = (result: JsonRecord): Issue[] => {
 			if (
 				!Array.isArray(result.issues) ||
 				!result.issues.every(
@@ -350,6 +338,86 @@ export class JiraTransport {
 				)
 			)
 				throw new Error('Jira returned invalid issues.');
+			return result.issues as Issue[];
+		};
+		const requestPage = (pageToken?: string) =>
+			this.request({
+				method: 'POST',
+				path,
+				body: searchBody(pageToken),
+			});
+		const discardSavedPage = () => {
+			limits.pageTokenFallback?.();
+			nextPageToken = undefined;
+			tokens.clear();
+			issueIds.clear();
+			afterCreated = limits.fallbackAfterCreated ?? limits.afterCreated;
+			jql = buildPollingJql(
+				predicate,
+				lowerBound,
+				limits.direction,
+				afterCreated,
+				limits.createdBefore,
+			);
+		};
+		if (
+			nextPageToken !== undefined &&
+			limits.pageTokenRequestKey !== undefined &&
+			limits.pageTokenRequestKey !== requestKey()
+		)
+			discardSavedPage();
+		if (nextPageToken !== undefined) {
+			if (typeof nextPageToken !== 'string' || !nextPageToken)
+				throw new Error('Invalid search continuation.');
+			tokens.add(nextPageToken);
+		}
+		for (let page = 0; page < limit; page++) {
+			const requestPageToken = nextPageToken;
+			let consumedPageToken = requestPageToken;
+			let result: JsonRecord;
+			try {
+				result = await requestPage(requestPageToken);
+			} catch (error) {
+				const status =
+					error instanceof JiraReadError || error instanceof PollBudgetExhausted
+						? error.status
+						: retryDetails(error).status;
+				if (
+					page !== 0 ||
+					requestPageToken === undefined ||
+					status === undefined ||
+					status < 400 ||
+					status >= 500
+				)
+					// The node entry point wraps the preserved Jira error after scan-state handling.
+					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+					throw error;
+				discardSavedPage();
+				consumedPageToken = undefined;
+				result = await requestPage();
+			}
+			let pageIssues = validateIssues(result);
+			if (
+				page === 0 &&
+				consumedPageToken !== undefined &&
+				limits.pageTokenLastKey !== undefined &&
+				!pageIssues.some((issue) => issue.key === limits.pageTokenLastKey)
+			) {
+				discardSavedPage();
+				consumedPageToken = undefined;
+				result = await requestPage();
+				pageIssues = validateIssues(result);
+			}
+			const warningValues = [result.warnings, result.warningMessages].filter(
+				(value) => value !== undefined,
+			);
+			if (
+				warningValues.some((value) => !Array.isArray(value)) ||
+				warningValues.some((value) => Array.isArray(value) && value.length > 0)
+			)
+				throw new Error(
+					'Jira search returned warnings and may be incomplete. Narrow the JQL before retrying.',
+				);
 			// `isLast` is being retired from the Jira search response. Prefer the
 			// token key when it is present and treat `isLast` as a cross-check; a
 			// response carrying neither could be a truncated page, so fail.
@@ -370,19 +438,19 @@ export class JiraTransport {
 					typeof result.nextPageToken !== 'string' ||
 					!result.nextPageToken ||
 					tokens.has(result.nextPageToken) ||
-					result.issues.length === 0
+					pageIssues.length === 0
 				)
 					throw new Error('Jira search pagination did not advance.');
 				followingPageToken = result.nextPageToken;
 				tokens.add(followingPageToken);
 			}
-			for (const issue of result.issues) {
+			for (const issue of pageIssues) {
 				if (issueIds.has(issue.id as string))
 					throw new Error('Jira search repeated an issue across pages. Retry the poll.');
 				issueIds.add(issue.id as string);
 				yield issue as Issue;
 			}
-			limits.pageProgress?.(followingPageToken);
+			limits.pageProgress?.(consumedPageToken, pageIssues.at(-1)?.key, requestKey());
 			if (isLast) return;
 			nextPageToken = followingPageToken;
 		}

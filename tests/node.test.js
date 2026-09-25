@@ -819,7 +819,7 @@ test('an ample budget emits and saves exactly what no budget does', async () => 
 	assert.deepEqual(budgeted.ids, ['1', '2', '3', '4']);
 	assert.deepEqual(budgeted, await run(undefined));
 });
-test('a budget stop mid-pagination emits the prefix, saves the continuation, and the next poll finishes the window without loss or duplicates', async () => {
+test('a budget stop resumes from the creation minute and skips handled keys without loss or duplicates', async () => {
 	const issues = [1, 2, 3, 4].map((n) => ({ id: String(n), updated: n }));
 	const f = await activated({ issues, costMs: 6_000 });
 	f.ctx.getPollBudgetMs = () => 10_000;
@@ -831,7 +831,6 @@ test('a budget stop mid-pagination emits the prefix, saves the continuation, and
 		until: epoch + 10,
 		afterCreated: epoch,
 		afterKeys: ['TEST-1', 'TEST-2'],
-		pageToken: 'fake-page-1',
 		partial: undefined,
 	});
 	assert.equal(f.state.jiraPollState.checkpoint, epoch, 'checkpoint waits for the window');
@@ -840,9 +839,10 @@ test('a budget stop mid-pagination emits the prefix, saves the continuation, and
 	assert.deepEqual(emittedIds(await onClock(f.clock, f.ctx)), ['3', '4']);
 	assert.equal(
 		f.requests[2].body.jql,
-		`updated >= ${epoch} AND created <= ${epoch + 10} ORDER BY created ASC, key ASC`,
+		`updated >= ${epoch} AND created <= ${epoch + 10} AND created >= ${epoch} ORDER BY created ASC, key ASC`,
 	);
-	assert.ok(f.requests[2].body.nextPageToken);
+	assert.equal(f.requests[2].body.nextPageToken, undefined);
+	assert.match(f.requests[2].body.jql, new RegExp(`created >= ${epoch}`));
 	assert.equal(f.state.jiraPollState.window, undefined);
 	assert.equal(
 		f.state.jiraPollState.checkpoint,
@@ -867,7 +867,8 @@ test('a resumed multi-project search continues after handled keys without numeri
 	f.clock.now = 100_000;
 	assert.deepEqual(emittedIds(await onClock(f.clock, f.ctx)), ['200']);
 	assert.doesNotMatch(f.requests[2].body.jql, /\bkey\s+(?:NOT\s+)?IN\s*\(/i);
-	assert.ok(f.requests[2].body.nextPageToken);
+	assert.equal(f.requests[2].body.nextPageToken, undefined);
+	assert.match(f.requests[2].body.jql, new RegExp(`created >= ${epoch}`));
 	assert.doesNotMatch(f.requests[2].body.jql, /\bid\s*>/);
 });
 test('the same finite budget on every poll drains a large backlog oldest first and retires its keys', async () => {
@@ -938,7 +939,7 @@ test('returned timestamps newer than the search order cannot skip unread issues'
 		for (const issue of result.issues ?? []) issue.fields.updated = iso(f.clock.now);
 		return result;
 	};
-	const { delivered } = await drain(f, 10_000, 4, { from: 10, pick: emitted });
+	const { delivered } = await drain(f, 15_000, 4, { from: 10, pick: emitted });
 	assert.deepEqual(
 		delivered.filter(([type]) => type === 'issue.created').map(([, id]) => id),
 		['1', '2', '3', '4'],
@@ -947,8 +948,149 @@ test('returned timestamps newer than the search order cannot skip unread issues'
 test('ties in a creation minute resume without loss or duplicates', async () => {
 	const issues = [1, 2, 3, 4, 5].map((n) => ({ id: String(n), updated: 1 }));
 	const f = await activated({ issues, costMs: 6_000 });
-	const { delivered } = await drain(f, 10_000, 5);
+	const { delivered } = await drain(f, 15_000, 5);
 	assert.deepEqual(delivered, ['1', '2', '3', '4', '5']);
+});
+test('an expired saved search token falls back to the creation minute and drains without loss', async () => {
+	const issues = Array.from({ length: 10 }, (_, n) => ({
+		id: String(n + 1),
+		created: n * 1_000,
+		updated: n * 1_000 + 1,
+	}));
+	const f = await activated({ issues, pageSize: 2, costMs: 10_000 });
+	f.ctx.getPollBudgetMs = () => 25_000;
+	f.clock.now = 10 * minute;
+	const delivered = [...emitted(await onClock(f.clock, f.ctx))];
+	assert.deepEqual(
+		delivered.map(([, id]) => id),
+		[1, 1, 2, 2, 3, 3, 4, 4].map(String),
+	);
+	assert.equal(
+		await onClock(f.clock, f.ctx),
+		null,
+		'replaying handled pages makes no cursor progress',
+	);
+	const tokenRequests = [];
+	const fallbackRequests = [];
+	const expiredToken = f.state.jiraPollState.window.pageToken;
+	const original = f.ctx.helpers.httpRequestWithAuthentication;
+	f.ctx.helpers.httpRequestWithAuthentication = async function (name, request, options) {
+		if (request.body?.nextPageToken === expiredToken) {
+			tokenRequests.push(request);
+			throw Object.assign(new Error('Search page token has expired'), {
+				statusCode: 400,
+				response: { status: 400, data: { errorMessages: ['Search page token has expired.'] } },
+			});
+		}
+		if (tokenRequests.length && request.method === 'POST' && !request.body?.nextPageToken)
+			fallbackRequests.push(request);
+		return await original.call(this, name, request, options);
+	};
+	f.ctx.getPollBudgetMs = () => 300_000;
+	f.clock.now += minute;
+	const resumed = emitted(await onClock(f.clock, f.ctx));
+	assert.equal(tokenRequests.length, 1, 'the saved token is tried once');
+	assert.ok(tokenRequests[0].body.nextPageToken);
+	assert.ok(
+		fallbackRequests.some((request) => request.body.jql.includes(`created >= ${epoch}`)),
+		'the rejected token causes a query from the saved creation minute',
+	);
+	delivered.push(...resumed);
+	delivered.push(...emitted(await onClock(f.clock, f.ctx)));
+	assert.deepEqual(
+		delivered.map(([, id]) => id),
+		Array.from({ length: 10 }, (_, n) => [String(n + 1), String(n + 1)]).flat(),
+	);
+});
+test('an offset token is checked against its page after an earlier issue is deleted', async () => {
+	const issues = Array.from({ length: 10 }, (_, n) => ({
+		id: String(n + 1),
+		created: n * 1_000,
+		updated: n * 1_000 + 1,
+	}));
+	const clock = { now: 0 };
+	const base = jiraServer({ issues, clock, pageSize: 100 });
+	const read = async (request, count) => {
+		if (request.method !== 'POST' || request.body?.maxResults === 1)
+			return await base(request, count);
+		const cost = 10_000;
+		clock.now += cost;
+		if (cost > request.timeout)
+			throw Object.assign(new Error(`timeout of ${request.timeout}ms exceeded`), {
+				code: 'ECONNABORTED',
+			});
+		const { nextPageToken, ...body } = request.body;
+		const all = (await base({ ...request, body }, count)).issues;
+		const offset = Number(nextPageToken ?? 0);
+		const page = all.slice(offset, offset + 2);
+		const next = offset + 2;
+		const isLast = next >= all.length;
+		return {
+			issues: page,
+			isLast,
+			...(isLast ? {} : { nextPageToken: String(next) }),
+		};
+	};
+	const f = fixture({ read });
+	await onClock(clock, f.ctx);
+	f.ctx.getPollBudgetMs = () => 25_000;
+	clock.now = 10 * minute;
+	const delivered = [...emitted(await onClock(clock, f.ctx))];
+	assert.equal(delivered.length, 8);
+	assert.equal(await onClock(clock, f.ctx), null);
+	issues.splice(0, 1);
+	f.ctx.getPollBudgetMs = () => 300_000;
+	clock.now += minute;
+	delivered.push(...emitted(await onClock(clock, f.ctx)));
+	assert.deepEqual(
+		delivered.map(([, id]) => id),
+		Array.from({ length: 10 }, (_, n) => [String(n + 1), String(n + 1)]).flat(),
+	);
+});
+test('a saved search token tied to the old request body falls back after the API version changes', async () => {
+	const issues = Array.from({ length: 10 }, (_, n) => ({
+		id: String(n + 1),
+		created: n * 1_000,
+		updated: n * 1_000 + 1,
+	}));
+	const f = await activated(
+		{ issues, pageSize: 2, costMs: 10_000 },
+		{ params: { event: 'created', options: { simplify: true } } },
+	);
+	const tokenQueries = new Map();
+	const original = f.ctx.helpers.httpRequestWithAuthentication;
+	f.ctx.helpers.httpRequestWithAuthentication = async function (name, request, options) {
+		const { nextPageToken, ...body } = request.body ?? {};
+		const signature = JSON.stringify({ url: request.url, body });
+		if (nextPageToken && tokenQueries.get(nextPageToken) !== signature)
+			throw Object.assign(new Error('Search page token belongs to a different request'), {
+				statusCode: 400,
+				response: { status: 400, data: { errorMessages: ['Search page token is invalid.'] } },
+			});
+		const result = await original.call(this, name, request, options);
+		if (result?.nextPageToken) tokenQueries.set(result.nextPageToken, signature);
+		return result;
+	};
+	f.ctx.getPollBudgetMs = () => 25_000;
+	f.clock.now = 10 * minute;
+	const simpleIds = (result) => (result ? result[0].map((item) => item.json.id) : []);
+	const delivered = [...simpleIds(await onClock(f.clock, f.ctx))];
+	assert.equal(await onClock(f.clock, f.ctx), null);
+	const oldTokens = new Set(tokenQueries.keys());
+	f.params.options.outputFormat = 'wiki';
+	f.ctx.getPollBudgetMs = () => 300_000;
+	f.clock.now += minute;
+	delivered.push(...simpleIds(await onClock(f.clock, f.ctx)));
+	const changedRequests = f.requests.filter((request) =>
+		request.url.endsWith('/rest/api/2/search/jql'),
+	);
+	assert.ok(tokenQueries.size > 0);
+	assert.ok(changedRequests.length > 0);
+	assert.ok(changedRequests.every((request) => !oldTokens.has(request.body.nextPageToken)));
+	assert.deepEqual(
+		delivered,
+		Array.from({ length: 10 }, (_, n) => String(n + 1)),
+	);
 });
 test('comment mode stopping mid-issue saves the comment offset and loses no comment', async () => {
 	const issues = [
@@ -1085,6 +1227,8 @@ test('every request timeout is capped to the remaining budget, and a capped time
 		'TEST-4',
 	]);
 	f.clock.now = 100_000;
+	assert.equal(await onClock(f.clock, f.ctx), null, 'the minute replay cannot reach a new page');
+	f.clock.now += minute;
 	assert.deepEqual(emittedIds(await onClock(f.clock, f.ctx)), ['5', '6']);
 });
 test('manual runs ignore the host budget', async () => {
@@ -1198,7 +1342,7 @@ test('more than 40,000 events drain across polls instead of failing forever', as
 	const ids = new Set([...first[0], ...second[0]].map((item) => item.json.eventId));
 	assert.equal(ids.size, 40_002);
 });
-test('without a host poll budget, a six-hour backlog over 40,000 events completes in one poll', async () => {
+test('without a host poll budget, one full interval hands over the key cap and drains next poll', async () => {
 	const duration = 6 * 60 * minute;
 	const issues = Array.from({ length: 20_001 }, (_, n) => {
 		const created = Math.floor((n * duration) / 20_001);
@@ -1206,12 +1350,22 @@ test('without a host poll budget, a six-hour backlog over 40,000 events complete
 	});
 	const f = await activated({ issues, pageSize: 5_000 });
 	f.clock.now = duration;
-	const result = await onClock(f.clock, f.ctx);
+	const first = await onClock(f.clock, f.ctx);
 	assert.equal(f.ctx.getPollBudgetMs, undefined);
-	assert.equal(result[0].length, 40_002);
-	assert.equal(f.state.jiraPollState.checkpoint, epoch + duration);
+	assert.equal(first[0].length, 40_000);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch);
+	assert.equal(f.state.jiraPollState.window.until, epoch + duration);
+	assert.ok(
+		f.requests.every((request) => request.body.jql.includes(`created <= ${epoch + duration}`)),
+	);
+	f.clock.now += minute;
+	const second = await onClock(f.clock, f.ctx);
+	assert.equal(second[0].length, 2);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch + duration + minute);
 	assert.equal(f.state.jiraPollState.window, undefined);
-	assert.equal(new Set(result[0].map((item) => item.json.eventId)).size, 40_002);
+	const ids = new Set([...first[0], ...second[0]].map((item) => item.json.eventId));
+	assert.equal(ids.size, 40_002);
+	assert.ok(f.requests.length <= 8, `the outage drains with ${f.requests.length} searches`);
 });
 test('a rate limit after progress stops quietly on the output but warns in the log', async () => {
 	const warnings = [];
@@ -1232,6 +1386,33 @@ test('a rate limit after progress stops quietly on the output but warns in the l
 	assert.deepEqual(f.state.jiraPollState.window.afterKeys, ['TEST-1', 'TEST-2']);
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /HTTP 429/);
+});
+test('a resumed search error preserves Jira status and names its saved window', async () => {
+	const f = await activated({
+		issues: [1, 2, 3, 4].map((n) => ({ id: String(n), updated: n })),
+		costMs: 6_000,
+	});
+	f.ctx.getPollBudgetMs = () => 10_000;
+	f.clock.now = 10;
+	await onClock(f.clock, f.ctx);
+	assert.ok(f.state.jiraPollState.window);
+	const original = f.ctx.helpers.httpRequestWithAuthentication;
+	f.ctx.helpers.httpRequestWithAuthentication = async function (name, request, options) {
+		if (request.method === 'POST' && request.body?.maxResults !== 1)
+			throw Object.assign(new Error('JQL field does not exist'), {
+				statusCode: 400,
+				response: { status: 400, data: { errorMessages: ['JQL field does not exist'] } },
+			});
+		return await original.call(this, name, request, options);
+	};
+	f.ctx.getPollBudgetMs = () => 300_000;
+	f.clock.now = 100_000;
+	await assert.rejects(onClock(f.clock, f.ctx), (error) => {
+		assert.equal(error.httpCode, '400');
+		assert.match(error.message, /checkpoint .*window \[/);
+		assert.match(error.message, /JQL field does not exist/);
+		return true;
+	});
 });
 
 test('a deleted partial issue is dropped with a warning and the issues behind it still flow', async () => {
@@ -1368,7 +1549,7 @@ test('a comment created after the window bound on an older issue is emitted in t
 	assert.equal(await onClock(f.clock, f.ctx), null);
 });
 
-test('a no-budget outage advances through bounded intervals in immutable creation order', async () => {
+test('a no-budget outage uses one bounded interval in immutable creation order', async () => {
 	// Issue IDs disagree with creation time; the oldest issue still arrives first.
 	const issues = [
 		{ id: '3', updated: 40 * minute },
@@ -1383,11 +1564,8 @@ test('a no-budget outage advances through bounded intervals in immutable creatio
 		epoch + 60 * minute,
 		'no budget: one poll reaches the present',
 	);
-	assert.deepEqual(
-		f.requests.map((request) => /created <= (\d+)/.exec(request.body.jql)[1] - epoch),
-		[15, 30, 45, 60].map((value) => value * minute),
-		'the poll advances through fifteen-minute search intervals',
-	);
+	assert.equal(f.requests.length, 1);
+	assert.equal(/created <= (\d+)/.exec(f.requests[0].body.jql)[1] - epoch, 60 * minute);
 });
 test('old issues edited through an outage are fetched in one near-linear scan', async () => {
 	const old = -365 * 24 * 60 * minute;
@@ -1522,6 +1700,32 @@ test('OAuth2 activation validation uses the refresh-aware request path and bound
 		activationRequests.map(({ option }) => option),
 		[{ oauth2: { tokenExpiredStatusCode: 403 } }, { oauth2: { tokenExpiredStatusCode: 404 } }],
 	);
+});
+test('an OAuth activation deadline keeps Jira authentication details visible', async () => {
+	const f = fixture({
+		credentialType: 'jiraSoftwareCloudOAuth2Api',
+		credentials: structuredClone(oauthCredentials),
+		params: { authentication: 'oAuth2' },
+		read: async (request) => {
+			if (request.url.endsWith('/oauth/token/accessible-resources'))
+				return [{ id: 'cloud-1', url: 'https://example.atlassian.net' }];
+			Date.now = () => epoch + 200;
+			throw {
+				statusCode: 401,
+				response: {
+					status: 401,
+					data: { errorMessages: ['Client must be authenticated'] },
+				},
+			};
+		},
+	});
+	f.ctx.getPollBudgetMs = () => 100;
+	await assert.rejects(at(0, f.ctx), (error) => {
+		assert.equal(error.httpCode, '401');
+		assert.match(error.message, /Client must be authenticated/);
+		assert.doesNotMatch(error.message, /OAuth refresh deadline/);
+		return true;
+	});
 });
 test('OAuth2 fingerprint survives token refresh and refetches sites once on a cache miss', async () => {
 	const resources = [];

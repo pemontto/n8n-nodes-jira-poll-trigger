@@ -292,7 +292,8 @@ export class JiraPollTrigger implements INodeType {
 						const messages = body?.errorMessages;
 						const errors = body?.errors;
 						const jiraMessage = String(
-							body?.message ??
+							(error instanceof PollBudgetExhausted && error.details ? error.details : undefined) ??
+								body?.message ??
 								(Array.isArray(messages) ? messages[0] : undefined) ??
 								(errors && typeof errors === 'object'
 									? Object.values(errors as IDataObject)[0]
