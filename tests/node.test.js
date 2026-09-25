@@ -868,6 +868,36 @@ test('a resumed multi-project search continues after handled keys without numeri
 	assert.match(f.requests[2].body.jql, new RegExp(`created >= ${epoch}`));
 	assert.doesNotMatch(f.requests[2].body.jql, /\bid\s*>/);
 });
+test('a moved issue is not delivered twice when a saved page token falls back', async () => {
+	const issues = Array.from({ length: 6 }, (_, n) => ({
+		id: String(n + 1),
+		key: `TEST-${n + 1}`,
+		created: n + 1,
+		updated: n + 1,
+	}));
+	const f = await activated({ issues, pageSize: 2, costMs: 6_000 });
+	f.ctx.getPollBudgetMs = () => 15_000;
+	f.clock.now = 10;
+	assert.deepEqual(emittedIds(await onClock(f.clock, f.ctx)), ['1', '2', '3', '4']);
+	assert.deepEqual(f.state.jiraPollState.window.afterIds, ['1', '2', '3', '4']);
+
+	// Jira changes the moved issue's key, so the saved page no longer contains
+	// its recorded last key and the transport falls back to the minute query.
+	issues[3].key = 'OTHER-4';
+	f.ctx.getPollBudgetMs = () => 60_000;
+	f.clock.now = 100_000;
+	const requestStart = f.requests.length;
+	const resumed = await onClock(f.clock, f.ctx);
+	assert.deepEqual(emittedIds(resumed), ['5', '6']);
+	const resumedSearches = f.requests
+		.slice(requestStart)
+		.filter((request) => request.method === 'POST');
+	assert.ok(resumedSearches[0].body.nextPageToken, 'the saved page token is replayed first');
+	assert.equal(resumedSearches[1].body.nextPageToken, undefined, 'fallback starts at the minute');
+	assert.equal(resumedSearches[1].body.jql.includes('created >='), true);
+	const allDeliveries = ['1', '2', '3', '4', ...emittedIds(resumed)];
+	assert.equal(new Set(allDeliveries).size, 6);
+});
 test('the same finite budget on every poll drains a large backlog oldest first and retires its keys', async () => {
 	// Sixty issues over an hour; every poll affords two pages of two.
 	const issues = Array.from({ length: 60 }, (_, n) => ({ id: String(n + 1), updated: n * minute }));
@@ -1376,6 +1406,7 @@ test('comment mode stopping mid-issue saves the comment offset and loses no comm
 		until: epoch + 10,
 		afterCreated: epoch,
 		afterKeys: ['TEST-1'],
+		afterIds: ['1'],
 	});
 	assert.equal(partial.issue.id, '2');
 	assert.deepEqual([partial.startAt, partial.lastCommentId, partial.done], [2, 'c', false]);

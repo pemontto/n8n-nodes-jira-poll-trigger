@@ -38,6 +38,8 @@ export interface PollWindow {
 	afterCreated?: number;
 	/** Issue keys already processed at afterCreated. */
 	afterKeys?: string[];
+	/** Issue IDs already processed at afterCreated, including issues whose key changed. */
+	afterIds?: string[];
 	/** Jira token used to re-read the last consumed page; undefined means its first page. */
 	pageToken?: string;
 	/** Creation bound used by the query that produced `pageToken`. */
@@ -199,6 +201,11 @@ function validateState(state: PollState): void {
 						window.afterKeys.length < 1 ||
 						window.afterKeys.length > MAX_DEDUP_KEYS ||
 						window.afterKeys.some((key) => typeof key !== 'string'))) ||
+				(window.afterIds !== undefined &&
+					(!Array.isArray(window.afterIds) ||
+						window.afterIds.length < 1 ||
+						window.afterIds.length > MAX_DEDUP_KEYS ||
+						window.afterIds.some((id) => typeof id !== 'string'))) ||
 				(window.pageToken !== undefined &&
 					(typeof window.pageToken !== 'string' || window.pageToken.length === 0)) ||
 				(window.pageTokenAfterCreated !== undefined &&
@@ -415,6 +422,7 @@ async function scanWindow(
 	};
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
+	let afterIds = window.afterIds ? [...window.afterIds] : undefined;
 	let resumeWithPageToken =
 		(window.resumeWithPageToken === true || window.pageToken !== undefined) &&
 		window.pageTokenLastKey !== undefined &&
@@ -465,9 +473,11 @@ async function scanWindow(
 		const minute = Math.floor(created / 60_000) * 60_000;
 		if (afterCreated === minute) {
 			if (!afterKeys?.includes(issue.key)) afterKeys = [...(afterKeys ?? []), issue.key];
+			if (!afterIds?.includes(issue.id)) afterIds = [...(afterIds ?? []), issue.id];
 		} else {
 			afterCreated = minute;
 			afterKeys = [issue.key];
+			afterIds = [issue.id];
 		}
 	};
 	const alreadyHandledAtMinute = (issue: Issue): boolean => {
@@ -477,7 +487,9 @@ async function scanWindow(
 			throw new Error('Jira returned an invalid issue creation timestamp.');
 		const minute = Math.floor(created / 60_000) * 60_000;
 		return (
-			minute < afterCreated || (minute === afterCreated && Boolean(afterKeys?.includes(issue.key)))
+			minute < afterCreated ||
+			(minute === afterCreated &&
+				Boolean(afterKeys?.includes(issue.key) || afterIds?.includes(issue.id)))
 		);
 	};
 	const dropMissingIssue = (issue: Issue): void => {
@@ -618,7 +630,8 @@ async function scanWindow(
 			value ? [value.issue.id, value.startAt, value.lastCommentId, value.done].join('/') : '';
 		const positionAdvanced =
 			afterCreated !== window.afterCreated ||
-			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []);
+			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []) ||
+			JSON.stringify(afterIds ?? []) !== JSON.stringify(window.afterIds ?? []);
 		resumeWithPageToken = pageTokenLastKey !== undefined && pageTokenRequestKey !== undefined;
 		const pageTokenPositionAdvanced =
 			pageTokenLastKey !== undefined &&
@@ -671,6 +684,7 @@ async function scanWindow(
 							until: upper,
 							afterCreated,
 							afterKeys,
+							afterIds,
 							...(pageToken !== undefined ? { pageToken } : {}),
 							...(pageTokenAfterCreated !== undefined ? { pageTokenAfterCreated } : {}),
 							...(pageTokenLastKey !== undefined ? { pageTokenLastKey } : {}),
