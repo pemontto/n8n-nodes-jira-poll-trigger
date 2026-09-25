@@ -105,7 +105,10 @@ test('reuses built-in credentials without defining credentials', () => {
 	assert.equal(node.description.polling, true);
 });
 test('activation validates JQL, then subsequent event emits once and empty poll checkpoints', async () => {
-	const f = fixture({ trackActivation: true, read: async () => ({ issues: [issue()], isLast: true }) });
+	const f = fixture({
+		trackActivation: true,
+		read: async () => ({ issues: [issue()], isLast: true }),
+	});
 	assert.equal(await at(0, f.ctx), null);
 	assert.equal(f.requests.length, 1);
 	assert.equal(f.requests[0].body.maxResults, 1);
@@ -232,7 +235,7 @@ test('manual no-match search stops after two pages', async () => {
 test('manual comments stop after two pages per issue', async () => {
 	const f = fixture({
 		manual: true,
-	params: { resource: 'comment', options: { visibility: 'public' } },
+		params: { resource: 'comment', options: { visibility: 'public' } },
 		read: async (request) =>
 			request.method === 'POST'
 				? { issues: [issue()], isLast: true }
@@ -453,7 +456,10 @@ test('test limit does not cap scheduled polling or reset its boundary', async ()
 
 test('domain is an optional override under Options', () => {
 	for (const name of ['simplify', 'domain', 'visibility', 'excludedAccountIds', 'additionalFields'])
-		assert.equal(node.description.properties.find((p) => p.name === name), undefined);
+		assert.equal(
+			node.description.properties.find((p) => p.name === name),
+			undefined,
+		);
 	const option = node.description.properties
 		.find((p) => p.name === 'options')
 		.options.find((p) => p.name === 'domain');
@@ -636,7 +642,7 @@ function jiraServer({
 			const createdBefore = Number(/created <= (\d+)/.exec(jql)?.[1] ?? Infinity) - epoch;
 			const afterCreated = Number(/created >= (\d+)/.exec(jql)?.[1] ?? -Infinity) - epoch;
 			const handledKeys = new Set(
-				[...((/key NOT IN \(([^)]*)\)/.exec(jql)?.[1] ?? '').matchAll(/"((?:\\.|[^"])*)"/g))].map(
+				[...(/key NOT IN \(([^)]*)\)/.exec(jql)?.[1] ?? '').matchAll(/"((?:\\.|[^"])*)"/g)].map(
 					(match) => match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'),
 				),
 			);
@@ -658,8 +664,7 @@ function jiraServer({
 				)
 				.sort(
 					(a, b) =>
-						(a.created ?? a.updated) - (b.created ?? b.updated) ||
-						compareKeys(keyOf(a), keyOf(b)),
+						(a.created ?? a.updated) - (b.created ?? b.updated) || compareKeys(keyOf(a), keyOf(b)),
 				);
 			if (/DESC/.test(jql)) sorted.reverse();
 			const start = Number(request.body.nextPageToken ?? 0);
@@ -678,7 +683,10 @@ function jiraServer({
 						? {
 								renderedFields: {
 									comment: {
-										comments: embed(item.id).comments.map((c) => ({ ...c, body: `<p>${c.id}</p>` })),
+										comments: embed(item.id).comments.map((c) => ({
+											...c,
+											body: `<p>${c.id}</p>`,
+										})),
 									},
 								},
 							}
@@ -969,10 +977,7 @@ test('a rate limit on the first request whose wait cannot fit fails visibly with
 	await at(0, f.ctx);
 	const before = structuredClone(f.state.jiraPollState);
 	const started = Date.now();
-	await assert.rejects(
-		at(10, f.ctx),
-		/Jira issue poll for .*made no progress.*HTTP 429/i,
-	);
+	await assert.rejects(at(10, f.ctx), /Jira issue poll for .*made no progress.*HTTP 429/i);
 	assert.ok(Date.now() - started < 5_000, 'must not wait for Retry-After');
 	assert.equal(f.requests.length, 1);
 	assert.deepEqual(f.state.jiraPollState, before);
@@ -984,7 +989,9 @@ test('a non-progressing search error names the site, resource and checkpoint win
 	await at(0, f.ctx);
 	await assert.rejects(
 		at(10, f.ctx),
-		new RegExp(`Jira issue poll for example\\.atlassian\\.net made no progress at checkpoint ${epoch}, window \\[${epoch}, ${epoch + 10}\\]`),
+		new RegExp(
+			`Jira issue poll for example\\.atlassian\\.net made no progress at checkpoint ${epoch}, window \\[${epoch}, ${epoch + 10}\\]`,
+		),
 	);
 });
 test('an authentication failure after the deadline stays an error', async () => {
@@ -1010,7 +1017,12 @@ test('every request timeout is capped to the remaining budget, and a capped time
 		[20_000, 12_000, 4_000],
 	);
 	assert.equal(f.state.jiraPollState.window.afterCreated, epoch);
-	assert.deepEqual(f.state.jiraPollState.window.afterKeys, ['TEST-1', 'TEST-2', 'TEST-3', 'TEST-4']);
+	assert.deepEqual(f.state.jiraPollState.window.afterKeys, [
+		'TEST-1',
+		'TEST-2',
+		'TEST-3',
+		'TEST-4',
+	]);
 	f.clock.now = 100_000;
 	assert.deepEqual(emittedIds(await onClock(f.clock, f.ctx)), ['5', '6']);
 });
@@ -1185,7 +1197,11 @@ test('a deleted partial issue is dropped with a warning and the issues behind it
 	assert.equal(f.state.jiraPollState.window, undefined);
 	assert.equal(warnings.length, 1);
 	assert.match(warnings[0], /dropped issue 1/);
-	assert.equal(missingCommentReads, 1, 'the saved missing issue is skipped when search returns it again');
+	assert.equal(
+		missingCommentReads,
+		1,
+		'the saved missing issue is skipped when search returns it again',
+	);
 });
 test('revoked credentials returning 403 or 404 on resumed comments remain visible API errors', async () => {
 	for (const status of [403, 404]) {
@@ -1300,15 +1316,16 @@ test('old issues edited through an outage are fetched in one near-linear scan', 
 		created: old,
 		updated: (index + 1) * minute,
 	}));
-	const f = await activated(
-		{ issues, pageSize: 100 },
-		{ params: { event: 'updated' } },
-	);
+	const f = await activated({ issues, pageSize: 100 }, { params: { event: 'updated' } });
 	f.ctx.getPollBudgetMs = () => 2_000_000;
 	f.clock.now = 1_440 * minute;
 	assert.equal(emittedIds(await onClock(f.clock, f.ctx)).length, 1_440);
 	assert.equal(f.requests.length, 15, 'each of the 1,440 old edited issues is read once');
-	assert.ok(f.requests.every((request) => request.body.jql.includes(`created <= ${epoch + 1_440 * minute}`)));
+	assert.ok(
+		f.requests.every((request) =>
+			request.body.jql.includes(`created <= ${epoch + 1_440 * minute}`),
+		),
+	);
 });
 test('comment mode uses the comments embedded in the search and requests none for small issues', async () => {
 	const issues = [{ id: '1', updated: 3 }];
@@ -1514,5 +1531,8 @@ test('OAuth2 retry caps its timeout to the poll deadline', async () => {
 	};
 	assert.equal(await at(10, f.ctx), null);
 	const attempts = f.requests.filter((request) => request.url.endsWith('/search/jql'));
-	assert.deepEqual(attempts.map((request) => request.timeout), [100, 20]);
+	assert.deepEqual(
+		attempts.map((request) => request.timeout),
+		[100, 20],
+	);
 });

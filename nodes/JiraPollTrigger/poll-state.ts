@@ -147,7 +147,7 @@ function validateState(state: PollState): void {
 						window.afterKeys.length < 1 ||
 						window.afterKeys.length > MAX_DEDUP_KEYS ||
 						window.afterKeys.some((key) => typeof key !== 'string'))) ||
-				((window.afterCreated === undefined) !== (window.afterKeys === undefined)) ||
+				(window.afterCreated === undefined) !== (window.afterKeys === undefined) ||
 				(window.partial !== undefined &&
 					(!window.partial ||
 						!window.partial.issue ||
@@ -247,8 +247,7 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 		advanced ||= result.advanced;
 		dropped ??= result.dropped;
 		if (result.stopped !== undefined) {
-			if (!advanced)
-				throw noProgressError(config, current!, result, result.stopped);
+			if (!advanced) throw noProgressError(config, current!, result, result.stopped);
 			return {
 				events,
 				state: current,
@@ -376,7 +375,8 @@ async function scanWindow(
 	};
 	const advancePosition = (issue: Issue): void => {
 		const created = Date.parse(String(issue.fields.created ?? ''));
-		if (!Number.isFinite(created)) throw new Error('Jira returned an invalid issue creation timestamp.');
+		if (!Number.isFinite(created))
+			throw new Error('Jira returned an invalid issue creation timestamp.');
 		const minute = Math.floor(created / 60_000) * 60_000;
 		if (afterCreated === minute) {
 			if (!afterKeys?.includes(issue.key)) afterKeys = [...(afterKeys ?? []), issue.key];
@@ -454,7 +454,7 @@ async function scanWindow(
 					transient: true,
 					timedOut: error.timedOut,
 				});
-			} else if (budgeted && error instanceof JiraReadError && (error.transient || error.timedOut)) {
+		} else if (budgeted && error instanceof JiraReadError && (error.transient || error.timedOut)) {
 			stopped = error.message;
 			stopError = error;
 		} else if (isPaginationProgressError(error)) {
@@ -488,9 +488,7 @@ async function scanWindow(
 	const keepIssue =
 		stopped !== undefined ? (partial?.issue.id ?? activeIssueId ?? current?.issue.id) : undefined;
 	const priorKeys = new Set(
-		(manual ? [] : state!.seen)
-			.filter((entry) => entry.time >= lower)
-			.map((entry) => entry.key),
+		(manual ? [] : state!.seen).filter((entry) => entry.time >= lower).map((entry) => entry.key),
 	);
 	const retained = [...seen].filter(([key, time]) =>
 		stopped !== undefined

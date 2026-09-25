@@ -360,7 +360,8 @@ export class JiraPollTrigger implements INodeType {
 						{ errorMessages: error.details ? [error.details] : [], message: error.message },
 						{
 							message: error.message,
-							description: error.details ??
+							description:
+								error.details ??
 								(error.timedOut ? 'Timed out while reading from Jira.' : undefined),
 							httpCode:
 								error.status !== undefined

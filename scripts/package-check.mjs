@@ -15,14 +15,21 @@ for (const entry of pkg.n8n.nodes) assert(files.includes(entry), `Missing ${entr
 assert(files.includes('dist/nodes/JiraPollTrigger/jira.svg'));
 assert(files.includes('dist/nodes/JiraPollTrigger/JiraPollTrigger.node.json'));
 assert(!files.some((file) => file.endsWith('.tsbuildinfo')), 'TypeScript build info must not ship');
-assert(!files.some((file) => file.endsWith('.map')), 'Source maps to local source files must not ship');
+assert(
+	!files.some((file) => file.endsWith('.map')),
+	'Source maps to local source files must not ship',
+);
 assert(
 	files.every(
 		(file) =>
 			file.startsWith('dist/') || ['README.md', 'LICENSE.md', 'package.json'].includes(file),
 	),
 );
-assert(!files.some((file) => /(?:^|\/)(?:credentials|captures?|snapshots?|node_modules|\.env)(?:\/|$)/i.test(file)));
+assert(
+	!files.some((file) =>
+		/(?:^|\/)(?:credentials|captures?|snapshots?|node_modules|\.env)(?:\/|$)/i.test(file),
+	),
+);
 console.log(
 	`Package check passed: ${files.length} files; built-in credential reused, no credentials, test captures, build info, or source maps.`,
 );
