@@ -38,15 +38,19 @@ export interface PollWindow {
 	afterCreated?: number;
 	/** Issue keys already processed at afterCreated. */
 	afterKeys?: string[];
-	/** Jira page token for the last fully consumed page of an open search. */
+	/** Jira token used to resume the last consumed page or its successor. */
 	pageToken?: string;
 	/** Creation bound used by the query that produced `pageToken`. */
 	pageTokenAfterCreated?: number;
-	/** Last key in the page selected by `pageToken`, used to validate its position. */
+	/** Issue key used to validate the saved token's position. */
 	pageTokenLastKey?: string;
+	/** Creation time of the issue used to validate the saved token's position. */
+	pageTokenLastCreated?: number;
+	/** Whether `pageToken` selects the page after `pageTokenLastKey`. */
+	pageTokenContinuesAfterLastKey?: boolean;
 	/** Digest of the request that produced the token, excluding the token itself. */
 	pageTokenRequestKey?: string;
-	/** Use the saved page token only after replaying the minute query made no progress. */
+	/** Whether the saved page token is eligible for token-first resume. */
 	resumeWithPageToken?: boolean;
 	/**
 	 * Issue whose comments are outstanding: its search payload, the first unread
@@ -77,22 +81,28 @@ export interface SearchReadOptions {
 	/** Resume at this creation minute; `afterKeys` are skipped by the scanner. */
 	afterCreated?: number;
 	afterKeys?: string[];
-	/** Re-read this Jira page only when the minute query could not make progress. */
+	/** Resume this Jira search at its saved page or continuation. */
 	pageToken?: string;
-	/** Last key expected on the page selected by `pageToken`. */
+	/** Issue key used to validate the saved token's position. */
 	pageTokenLastKey?: string;
+	/** Creation time of the issue used to validate the saved token's position. */
+	pageTokenLastCreated?: number;
+	/** Whether `pageToken` selects the page after `pageTokenLastKey`. */
+	pageTokenContinuesAfterLastKey?: boolean;
 	/** Digest expected for the request that produced this token. */
 	pageTokenRequestKey?: string;
 	/** Creation cursor used if a saved page token is rejected or inconsistent. */
 	fallbackAfterCreated?: number;
-	/** Called after every fully consumed issue page with its token, last key and request digest. */
+	/** Called after every fully consumed issue page with its continuation and last position. */
 	pageProgress?: (
+		requestPageToken: string | undefined,
 		pageToken: string | undefined,
 		lastIssueKey: string | undefined,
+		lastIssueCreated: number | undefined,
 		pageTokenRequestKey: string,
 	) => void;
 	/** Called before a saved page token is discarded and the creation-minute query restarts. */
-	pageTokenFallback?: () => void;
+	pageTokenFallback?: (reason: 'request-mismatch' | 'rejected' | 'position-mismatch') => void;
 	/** Return only issues created at or before this epoch millisecond. */
 	createdBefore?: number;
 }
@@ -152,6 +162,23 @@ export class PollBudgetExhausted extends Error {
 
 const issueIdPattern = /^\d{1,15}$/;
 
+function compareIssueKeys(left: string, right: string): number {
+	const parts = (key: string) => /^(.*?)-(\d+)$/.exec(key);
+	const a = parts(left);
+	const b = parts(right);
+	if (a && b) return a[1].localeCompare(b[1]) || Number(a[2]) - Number(b[2]);
+	return left.localeCompare(right);
+}
+
+function compareIssuePosition(
+	leftCreated: number,
+	leftKey: string,
+	rightCreated: number,
+	rightKey: string,
+): number {
+	return leftCreated - rightCreated || compareIssueKeys(leftKey, rightKey);
+}
+
 function validateState(state: PollState): void {
 	const { window } = state;
 	if (
@@ -184,6 +211,17 @@ function validateState(state: PollState): void {
 					(typeof window.pageTokenLastKey !== 'string' ||
 						window.pageTokenLastKey.length === 0 ||
 						window.pageToken === undefined)) ||
+				(window.pageTokenLastCreated !== undefined &&
+					(!Number.isSafeInteger(window.pageTokenLastCreated) ||
+						window.pageTokenLastCreated < 0 ||
+						window.pageToken === undefined)) ||
+				(window.pageTokenContinuesAfterLastKey !== undefined &&
+					(typeof window.pageTokenContinuesAfterLastKey !== 'boolean' ||
+						window.pageToken === undefined ||
+						(window.pageTokenContinuesAfterLastKey &&
+							(window.pageTokenLastCreated === undefined ||
+								window.pageTokenLastKey === undefined ||
+								window.pageToken === undefined)))) ||
 				(window.pageTokenRequestKey !== undefined &&
 					(typeof window.pageTokenRequestKey !== 'string' ||
 						window.pageTokenRequestKey.length === 0 ||
@@ -236,6 +274,7 @@ export interface ScanResult {
 	state: PollState | undefined;
 	stopped?: string;
 	stopError?: JiraReadError;
+	pageTokenReplayBlocked?: boolean;
 	/** ID of a partly read issue that was dropped because Jira no longer serves it. */
 	dropped?: string;
 }
@@ -384,14 +423,26 @@ async function scanWindow(
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
 	let resumeWithPageToken =
-		window.resumeWithPageToken === true &&
 		window.pageToken !== undefined &&
-		window.pageTokenLastKey !== undefined;
+		window.pageTokenLastKey !== undefined &&
+		window.pageTokenRequestKey !== undefined;
 	let pageToken = resumeWithPageToken ? window.pageToken : undefined;
+	const pageTokenAtWindowStart = pageToken;
+	let savedPageTokenRejected = window.pageToken !== undefined && !resumeWithPageToken;
 	let pageTokenAfterCreated = resumeWithPageToken ? window.pageTokenAfterCreated : undefined;
 	let pageTokenLastKey = resumeWithPageToken ? window.pageTokenLastKey : undefined;
+	let pageTokenLastCreated = resumeWithPageToken ? window.pageTokenLastCreated : undefined;
+	let pageTokenContinuesAfterLastKey = resumeWithPageToken
+		? window.pageTokenContinuesAfterLastKey
+		: undefined;
 	let pageTokenRequestKey = resumeWithPageToken ? window.pageTokenRequestKey : undefined;
 	let queryAfterCreated = resumeWithPageToken ? pageTokenAfterCreated : afterCreated;
+	let replayBoundary: { key: string; created?: number } | undefined =
+		!resumeWithPageToken && window.pageToken !== undefined && window.pageTokenLastKey !== undefined
+			? { key: window.pageTokenLastKey, created: window.pageTokenLastCreated }
+			: undefined;
+	let pageTokenRejected = replayBoundary !== undefined;
+	let replayPassedBoundary = false;
 	let partial = window.partial;
 	let activeIssueId: string | undefined;
 	let current: { issue: Issue; next: number; last: string } | undefined;
@@ -479,24 +530,68 @@ async function scanWindow(
 						createdBefore: upper,
 						pageToken,
 						pageTokenLastKey,
+						pageTokenLastCreated,
+						pageTokenContinuesAfterLastKey,
 						pageTokenRequestKey,
 						fallbackAfterCreated: afterCreated,
-						pageTokenFallback: () => {
+						pageTokenFallback: (reason) => {
+							if (pageToken !== undefined && pageTokenLastKey !== undefined) {
+								replayBoundary = { key: pageTokenLastKey, created: pageTokenLastCreated };
+								pageTokenRejected = reason !== 'request-mismatch';
+								replayPassedBoundary = false;
+							}
+							savedPageTokenRejected = true;
 							pageToken = undefined;
 							pageTokenAfterCreated = undefined;
 							pageTokenLastKey = undefined;
+							pageTokenLastCreated = undefined;
+							pageTokenContinuesAfterLastKey = undefined;
 							pageTokenRequestKey = undefined;
 							resumeWithPageToken = false;
 							queryAfterCreated = afterCreated;
 						},
-						pageProgress: (consumedPageToken, lastIssueKey, requestKey) => {
-							pageToken = lastIssueKey === undefined ? undefined : consumedPageToken;
+						pageProgress: (
+							requestPageToken,
+							continuationToken,
+							lastIssueKey,
+							lastIssueCreated,
+							requestKey,
+						) => {
+							if (replayBoundary !== undefined && !replayPassedBoundary) return;
+							const consumedSavedToken =
+								!savedPageTokenRejected &&
+								pageTokenAtWindowStart !== undefined &&
+								requestPageToken === pageTokenAtWindowStart;
+							const currentPageToken =
+								continuationToken === undefined
+									? undefined
+									: requestPageToken !== undefined && !consumedSavedToken
+										? requestPageToken
+										: continuationToken;
+							pageToken = lastIssueKey === undefined ? undefined : currentPageToken;
 							pageTokenAfterCreated = pageToken === undefined ? undefined : queryAfterCreated;
 							pageTokenLastKey = pageToken === undefined ? undefined : lastIssueKey;
+							pageTokenLastCreated = pageToken === undefined ? undefined : lastIssueCreated;
+							pageTokenContinuesAfterLastKey =
+								pageToken === undefined
+									? undefined
+									: requestPageToken === undefined || consumedSavedToken;
 							pageTokenRequestKey = pageToken === undefined ? undefined : requestKey;
 						},
 					},
 		)) {
+			if (!manual && replayBoundary !== undefined && !replayPassedBoundary) {
+				const created = Date.parse(String(issue.fields.created ?? ''));
+				replayPassedBoundary =
+					replayBoundary.created !== undefined && Number.isFinite(created)
+						? compareIssuePosition(
+								created,
+								issue.key,
+								replayBoundary.created,
+								replayBoundary.key,
+							) >= 0
+						: issue.key === replayBoundary.key;
+			}
 			if (!manual && alreadyHandledAtMinute(issue)) continue;
 			if (!manual && droppedIssues.has(issue.id)) {
 				advancePosition(issue);
@@ -566,17 +661,25 @@ async function scanWindow(
 		const positionAdvanced =
 			afterCreated !== window.afterCreated ||
 			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []);
-		resumeWithPageToken = positionAdvanced
-			? false
-			: pageToken !== undefined && pageTokenLastKey !== undefined;
+		resumeWithPageToken =
+			pageToken !== undefined &&
+			pageTokenLastKey !== undefined &&
+			pageTokenRequestKey !== undefined;
+		const pageTokenPositionAdvanced =
+			pageTokenLastKey !== undefined &&
+			(window.pageTokenLastKey === undefined ||
+				(window.pageTokenLastCreated !== undefined &&
+					pageTokenLastCreated !== undefined &&
+					compareIssuePosition(
+						pageTokenLastCreated,
+						pageTokenLastKey,
+						window.pageTokenLastCreated,
+						window.pageTokenLastKey,
+					) > 0));
 		advanced =
 			events.length > 0 ||
 			positionAdvanced ||
-			pageToken !== window.pageToken ||
-			pageTokenAfterCreated !== window.pageTokenAfterCreated ||
-			pageTokenLastKey !== window.pageTokenLastKey ||
-			pageTokenRequestKey !== window.pageTokenRequestKey ||
-			resumeWithPageToken !== (window.resumeWithPageToken ?? false) ||
+			pageTokenPositionAdvanced ||
 			mark(partial) !== mark(window.partial);
 	}
 	// During a stopped window, the issue cursor excludes completed issues. Keep
@@ -595,6 +698,7 @@ async function scanWindow(
 		events,
 		stopped,
 		stopError,
+		pageTokenReplayBlocked: pageTokenRejected,
 		dropped,
 		advanced,
 		state: {
@@ -612,6 +716,10 @@ async function scanWindow(
 							...(pageToken !== undefined ? { pageToken } : {}),
 							...(pageTokenAfterCreated !== undefined ? { pageTokenAfterCreated } : {}),
 							...(pageTokenLastKey !== undefined ? { pageTokenLastKey } : {}),
+							...(pageTokenLastCreated !== undefined ? { pageTokenLastCreated } : {}),
+							...(pageTokenContinuesAfterLastKey !== undefined
+								? { pageTokenContinuesAfterLastKey }
+								: {}),
 							...(pageTokenRequestKey !== undefined ? { pageTokenRequestKey } : {}),
 							...(resumeWithPageToken ? { resumeWithPageToken: true } : {}),
 							partial,
@@ -633,6 +741,18 @@ function noProgressError(
 	const window = result.state.window;
 	const position = window ? `window [${window.since}, ${window.until}]` : 'no open window';
 	const prefix = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, ${position}`;
+	if (result.pageTokenReplayBlocked) {
+		const recovery =
+			"more issues were created in one minute than a poll can replay and Jira's page token did not survive. Narrow the JQL to reduce the issues created in that minute, then reset the trigger from now.";
+		if (result.stopError instanceof JiraReadError && result.stopError.status !== undefined)
+			return new JiraReadError(`${prefix}: ${recovery}`, result.stopError.status, {
+				details: result.stopError.details,
+				code: result.stopError.code,
+				transient: result.stopError.transient,
+				timedOut: result.stopError.timedOut,
+			});
+		return new Error(`${prefix}: ${recovery}`);
+	}
 	if (result.stopError instanceof JiraReadError)
 		return new JiraReadError(`${prefix}: ${reason}`, result.stopError.status, {
 			details: result.stopError.details,

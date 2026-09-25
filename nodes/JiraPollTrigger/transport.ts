@@ -51,6 +51,23 @@ function record(value: unknown): value is JsonRecord {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function compareIssueKeys(left: string, right: string): number {
+	const parts = (key: string) => /^(.*?)-(\d+)$/.exec(key);
+	const a = parts(left);
+	const b = parts(right);
+	if (a && b) return a[1].localeCompare(b[1]) || Number(a[2]) - Number(b[2]);
+	return left.localeCompare(right);
+}
+
+function compareIssuePosition(
+	leftCreated: number,
+	leftKey: string,
+	rightCreated: number,
+	rightKey: string,
+): number {
+	return leftCreated - rightCreated || compareIssueKeys(leftKey, rightKey);
+}
+
 /** Keep quoted strings intact while checking the top-level predicate. */
 export function buildPollingJql(
 	predicate: string,
@@ -346,8 +363,8 @@ export class JiraTransport {
 				path,
 				body: searchBody(pageToken),
 			});
-		const discardSavedPage = () => {
-			limits.pageTokenFallback?.();
+		const discardSavedPage = (reason: 'request-mismatch' | 'rejected' | 'position-mismatch') => {
+			limits.pageTokenFallback?.(reason);
 			nextPageToken = undefined;
 			tokens.clear();
 			issueIds.clear();
@@ -365,15 +382,15 @@ export class JiraTransport {
 			limits.pageTokenRequestKey !== undefined &&
 			limits.pageTokenRequestKey !== requestKey()
 		)
-			discardSavedPage();
+			discardSavedPage('request-mismatch');
 		if (nextPageToken !== undefined) {
 			if (typeof nextPageToken !== 'string' || !nextPageToken)
 				throw new Error('Invalid search continuation.');
 			tokens.add(nextPageToken);
 		}
 		for (let page = 0; page < limit; page++) {
-			const requestPageToken = nextPageToken;
-			let consumedPageToken = requestPageToken;
+			let requestPageToken = nextPageToken;
+			let validateSavedPageToken = requestPageToken !== undefined;
 			let result: JsonRecord;
 			try {
 				result = await requestPage(requestPageToken);
@@ -385,26 +402,39 @@ export class JiraTransport {
 				if (
 					page !== 0 ||
 					requestPageToken === undefined ||
-					status === undefined ||
-					status < 400 ||
-					status >= 500
+					(status !== 400 && status !== 404 && status !== 410)
 				)
 					// The node entry point wraps the preserved Jira error after scan-state handling.
 					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 					throw error;
-				discardSavedPage();
-				consumedPageToken = undefined;
+				discardSavedPage('rejected');
+				requestPageToken = undefined;
+				validateSavedPageToken = false;
 				result = await requestPage();
 			}
 			let pageIssues = validateIssues(result);
 			if (
 				page === 0 &&
-				consumedPageToken !== undefined &&
+				validateSavedPageToken &&
 				limits.pageTokenLastKey !== undefined &&
-				!pageIssues.some((issue) => issue.key === limits.pageTokenLastKey)
+				!(
+					pageIssues.length === 0 ||
+					(limits.pageTokenContinuesAfterLastKey === true &&
+						limits.pageTokenLastCreated !== undefined &&
+						Number.isFinite(Date.parse(pageIssues[0].fields.created ?? '')) &&
+						compareIssuePosition(
+							Date.parse(pageIssues[0].fields.created ?? ''),
+							pageIssues[0].key,
+							limits.pageTokenLastCreated,
+							limits.pageTokenLastKey,
+						) > 0) ||
+					(limits.pageTokenContinuesAfterLastKey !== true &&
+						pageIssues.some((issue) => issue.key === limits.pageTokenLastKey))
+				)
 			) {
-				discardSavedPage();
-				consumedPageToken = undefined;
+				discardSavedPage('position-mismatch');
+				requestPageToken = undefined;
+				validateSavedPageToken = false;
 				result = await requestPage();
 				pageIssues = validateIssues(result);
 			}
@@ -450,7 +480,14 @@ export class JiraTransport {
 				issueIds.add(issue.id as string);
 				yield issue as Issue;
 			}
-			limits.pageProgress?.(consumedPageToken, pageIssues.at(-1)?.key, requestKey());
+			const lastIssue = pageIssues.at(-1);
+			limits.pageProgress?.(
+				requestPageToken,
+				isLast ? undefined : followingPageToken,
+				lastIssue?.key,
+				lastIssue ? Date.parse(lastIssue.fields.created ?? '') : undefined,
+				requestKey(),
+			);
 			if (isLast) return;
 			nextPageToken = followingPageToken;
 		}

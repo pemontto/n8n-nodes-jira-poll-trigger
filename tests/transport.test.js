@@ -171,6 +171,59 @@ test('search follows tokens and requests timestamps and rendered descriptions on
 	}
 	assert.equal(calls[1].body.nextPageToken, 'next');
 });
+test('only expired or inconsistent page tokens fall back to the minute query', async () => {
+	for (const status of [400, 404, 410]) {
+		const calls = [];
+		const fallbacks = [];
+		const transport = new JiraTransport(
+			async (request) => {
+				calls.push(request);
+				if (request.body.nextPageToken) throw nodeApiError(status);
+				return { issues: [], isLast: true };
+			},
+			{ maxRetries: 0 },
+		);
+		assert.deepEqual(
+			await collect(
+				transport.searchIssues('', 0, [], {
+					pageToken: 'saved',
+					pageTokenLastKey: 'TEST-1',
+					fallbackAfterCreated: 0,
+					pageTokenFallback: (reason) => fallbacks.push(reason),
+				}),
+			),
+			[],
+		);
+		assert.equal(calls.length, 2);
+		assert.equal(calls[0].body.nextPageToken, 'saved');
+		assert.equal(calls[1].body.nextPageToken, undefined);
+		assert.deepEqual(fallbacks, ['rejected']);
+	}
+	for (const status of [401, 403, 408, 429]) {
+		const calls = [];
+		const fallbacks = [];
+		const transport = new JiraTransport(
+			async (request) => {
+				calls.push(request);
+				throw nodeApiError(status, { 'Retry-After': '0' });
+			},
+			{ maxRetries: 0 },
+		);
+		await assert.rejects(
+			collect(
+				transport.searchIssues('', 0, [], {
+					pageToken: 'saved',
+					pageTokenLastKey: 'TEST-1',
+					fallbackAfterCreated: 0,
+					pageTokenFallback: (reason) => fallbacks.push(reason),
+				}),
+			),
+			(error) => error.status === status,
+		);
+		assert.equal(calls.length, 1);
+		assert.deepEqual(fallbacks, []);
+	}
+});
 test('isLast is optional and cross-checked against the token key', async () => {
 	for (const last of [{ nextPageToken: '' }, { nextPageToken: null }, { isLast: true }]) {
 		assert.deepEqual(
