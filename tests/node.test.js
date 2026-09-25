@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { NodeApiError } = require('n8n-workflow');
 const { JiraPollTrigger } = require('../dist/nodes/JiraPollTrigger/JiraPollTrigger.node');
 const node = new JiraPollTrigger();
 const epoch = Date.UTC(2026, 0, 1);
@@ -15,6 +16,8 @@ function fixture({
 	params = {},
 	credentials = {},
 	credentialType = 'jiraSoftwareCloudApi',
+	activationRead = false,
+	trackActivation = false,
 	read = async () => ({ issues: [], isLast: true }),
 } = {}) {
 	const state = {},
@@ -22,16 +25,13 @@ function fixture({
 		options = [];
 	const identity = ++fixtureSequence;
 	params = {
-		simplify: false,
 		resource: 'issue',
 		event: 'createdOrUpdated',
 		jql: '',
-		additionalFields: '',
 		options: {},
-		visibility: 'all',
-		excludedAccountIds: '',
 		...params,
 	};
+	params.options = { simplify: false, ...(params.options ?? {}) };
 	credentials = {
 		domain: 'https://example.atlassian.net',
 		email: 'fixture@example.invalid',
@@ -66,6 +66,8 @@ function fixture({
 			async httpRequestWithAuthentication(name, request, additional) {
 				assert.equal(this, ctx);
 				assert.equal(name, credentialType);
+				if (request.body?.maxResults === 1 && !activationRead && !trackActivation)
+					return { issues: [], isLast: true };
 				requests.push(request);
 				options.push(additional);
 				return read(request, requests.length);
@@ -102,16 +104,44 @@ test('reuses built-in credentials without defining credentials', () => {
 	assert.deepEqual(require('../package.json').n8n.credentials, []);
 	assert.equal(node.description.polling, true);
 });
-test('activation reads no history; subsequent event emits once and empty poll checkpoints', async () => {
-	const f = fixture({ read: async () => ({ issues: [issue()], isLast: true }) });
+test('activation validates JQL, then subsequent event emits once and empty poll checkpoints', async () => {
+	const f = fixture({ trackActivation: true, read: async () => ({ issues: [issue()], isLast: true }) });
 	assert.equal(await at(0, f.ctx), null);
-	assert.equal(f.requests.length, 0);
+	assert.equal(f.requests.length, 1);
+	assert.equal(f.requests[0].body.maxResults, 1);
+	assert.equal(f.requests[0].body.jql, '');
 	assert.equal(f.state.jiraPollState.activation, epoch);
 	assert.equal((await at(10, f.ctx))[0][0].json.eventType, 'issue.created');
 	assert.equal(await at(20, f.ctx), null);
 	assert.equal(f.state.jiraPollState.checkpoint, epoch + 20);
 	assert.equal(f.requests[0].url, 'https://example.atlassian.net/rest/api/3/search/jql');
 	assert.equal(f.requests[0].disableFollowRedirect, true);
+});
+test('reactivating from a discarded empty-poll snapshot starts cleanly', async () => {
+	const f = fixture({ read: async () => ({ issues: [], isLast: true }) });
+	assert.equal(await at(0, f.ctx), null);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch);
+	delete f.state.jiraPollState;
+	assert.equal(await at(10, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, epoch + 10);
+});
+test('invalid JQL fails activation with Jira message and HTTP status', async () => {
+	const f = fixture({
+		activationRead: true,
+		read: async () => {
+			throw Object.assign(new Error('JQL field does not exist'), {
+				statusCode: 400,
+				response: { status: 400, data: { message: 'JQL field does not exist' } },
+			});
+		},
+	});
+	await assert.rejects(at(0, f.ctx), (error) => {
+		assert(error instanceof NodeApiError);
+		assert.match(error.message, /JQL field does not exist/);
+		assert.equal(error.httpCode, '400');
+		return true;
+	});
+	assert.deepEqual(f.state, {});
 });
 test('maps filters, overlap, quoted JQL and fields; preserves raw comment', async () => {
 	const comments = [
@@ -131,11 +161,13 @@ test('maps filters, overlap, quoted JQL and fields; preserves raw comment', asyn
 	const f = fixture({
 		params: {
 			resource: 'comment',
-			visibility: 'public',
-			excludedAccountIds: ' excluded, excluded ',
 			jql: 'project = TEST OR summary ~ "ORDER BY"',
-			additionalFields: 'priority, summary, assignee',
-			options: { overlapMinutes: 7 },
+			options: {
+				visibility: 'public',
+				excludedAccountIds: ' excluded, excluded ',
+				additionalFields: 'priority, summary, assignee',
+				overlapMinutes: 7,
+			},
 		},
 		read: async (request) =>
 			request.method === 'POST'
@@ -168,8 +200,8 @@ test('maps filters, overlap, quoted JQL and fields; preserves raw comment', asyn
 	);
 	const config = JSON.parse(f.state.jiraPollState.fingerprint);
 	assert.equal('overlapMs' in config, false);
-	assert.deepEqual(config.excludedAccountIds, ['excluded']);
-	assert.equal(config.fields.includes('comment'), false, 'the embedded field is not fingerprinted');
+	assert.equal('excludedAccountIds' in config, false);
+	assert.equal('fields' in config, false);
 });
 test('manual returns one event without reading saved state', async () => {
 	const f = fixture({
@@ -197,7 +229,7 @@ test('manual no-match search stops after two pages', async () => {
 test('manual comments stop after two pages per issue', async () => {
 	const f = fixture({
 		manual: true,
-		params: { resource: 'comment', visibility: 'public' },
+	params: { resource: 'comment', options: { visibility: 'public' } },
 		read: async (request) =>
 			request.method === 'POST'
 				? { issues: [issue()], isLast: true }
@@ -244,54 +276,14 @@ test('failed later page preserves prior state', async () => {
 	assert.equal(f.state.jiraPollState, before);
 	assert.deepEqual(before, snapshot);
 });
-test('credential edit resets from now without saving token plaintext', async () => {
+test('API token rotation keeps the cursor without saving token plaintext', async () => {
 	const f = fixture();
 	await at(0, f.ctx);
 	f.credentials.apiToken = 'changed-synthetic-token';
 	assert.equal(await at(10, f.ctx), null);
-	assert.equal(f.state.jiraPollState.activation, epoch + 10);
-	assert.equal(f.requests.length, 0);
+	assert.equal(f.state.jiraPollState.activation, epoch);
+	assert.equal(f.requests.length, 1);
 	assert.equal(JSON.stringify(f.state).includes(f.credentials.apiToken), false);
-});
-
-test('overlapping polls with separately captured state reject the stale second snapshot', async () => {
-	let releaseRead, signalRead;
-	const blocked = new Promise((resolve) => {
-		releaseRead = resolve;
-	});
-	const reading = new Promise((resolve) => {
-		signalRead = resolve;
-	});
-	const first = fixture({
-		read: async () => {
-			signalRead();
-			await blocked;
-			return { issues: [issue()], isLast: true };
-		},
-	});
-	await at(0, first.ctx);
-	const second = fixture();
-	second.ctx.getWorkflow = first.ctx.getWorkflow;
-	second.ctx.getNode = first.ctx.getNode;
-	second.state.jiraPollState = structuredClone(first.state.jiraPollState);
-	const staleSnapshot = structuredClone(second.state);
-	const original = Date.now;
-	Date.now = () => epoch + 10;
-	try {
-		const firstPoll = node.poll.call(first.ctx);
-		await reading;
-		const secondPoll = node.poll.call(second.ctx);
-		const rejected = assert.rejects(secondPoll, /stale or uncommitted/);
-		releaseRead();
-		assert.equal((await firstPoll)[0][0].json.eventType, 'issue.created');
-		await rejected;
-		assert.equal(second.requests.length, 0);
-		assert.deepEqual(second.state, staleSnapshot);
-		assert.equal(first.state.jiraPollState.checkpoint, epoch + 10);
-	} finally {
-		releaseRead();
-		Date.now = original;
-	}
 });
 
 test('domain override routes search and comment pages using the selected credential', async () => {
@@ -392,7 +384,7 @@ test('simple output defaults to rendered comment HTML in the node', async () => 
 				? { issues: [issue()], isLast: true }
 				: { comments: [comment], startAt: 0, total: 1, maxResults: 100 },
 	});
-	delete f.params.simplify;
+	delete f.params.options.simplify;
 	const output = (await at(10, f.ctx))[0][0].json;
 	assert.equal(
 		node.description.properties
@@ -457,7 +449,8 @@ test('test limit does not cap scheduled polling or reset its boundary', async ()
 });
 
 test('domain is an optional override under Options', () => {
-	assert.equal(node.description.properties.find((p) => p.name === 'domain').type, 'hidden');
+	for (const name of ['simplify', 'domain', 'visibility', 'excludedAccountIds', 'additionalFields'])
+		assert.equal(node.description.properties.find((p) => p.name === name), undefined);
 	const option = node.description.properties
 		.find((p) => p.name === 'options')
 		.options.find((p) => p.name === 'domain');
@@ -478,10 +471,10 @@ test('all optional settings are alphabetized in Options with Simplify on by defa
 	);
 	assert.equal(fields.find((p) => p.name === 'simplify').default, true);
 });
-test('Options Simplify overrides legacy top-level value and applies body format', async () => {
+test('Options Simplify applies body format', async () => {
 	const f = fixture({
 		manual: true,
-		params: { simplify: false, options: { simplify: true, outputFormat: 'text' } },
+		params: { options: { simplify: true, outputFormat: 'text' } },
 		read: async () => ({
 			issues: [
 				{
@@ -502,29 +495,6 @@ test('Options Simplify overrides legacy top-level value and applies body format'
 	assert.equal(out.description, 'Description');
 	assert.equal(out.issue, undefined);
 	assert.equal(out.id, '1');
-});
-test('legacy expressions are evaluated only when Options does not override them', async () => {
-	const f = fixture({
-		manual: true,
-		params: { simplify: '={{ false }}', additionalFields: '={{ "priority" }}' },
-		read: async () => ({ issues: [issue()], isLast: true }),
-	});
-	let evaluated = [];
-	const originalGet = f.ctx.getNodeParameter;
-	f.ctx.getNodeParameter = (name, fallback) => {
-		const value = originalGet(name, fallback);
-		if (typeof value !== 'string' || !value.startsWith('=')) return value;
-		evaluated.push(value);
-		return value.includes('false') ? false : 'priority';
-	};
-	const out = (await at(10, f.ctx))[0][0].json;
-	assert.equal(out.eventType, 'issue.created');
-	assert(f.requests[0].body.fields.includes('priority'));
-	assert.equal(evaluated.length, 2);
-	f.params.options = { simplify: true, additionalFields: '' };
-	evaluated = [];
-	await at(10, f.ctx);
-	assert.equal(evaluated.length, 0);
 });
 test('wiki markup uses native v2 reads for description and comment body', async () => {
 	const f = fixture({
@@ -548,7 +518,7 @@ test('wiki markup uses native v2 reads for description and comment body', async 
 	assert.equal(out.description, undefined);
 	assert(f.requests.every((r) => r.url.includes('/rest/api/2/')));
 });
-test('raw mode keeps v3 even when a hidden wiki output format is stored', async () => {
+test('raw mode keeps v3 when wiki format is selected', async () => {
 	const f = fixture({
 		manual: true,
 		params: { options: { simplify: false, outputFormat: 'wiki' } },
@@ -557,20 +527,27 @@ test('raw mode keeps v3 even when a hidden wiki output format is stored', async 
 	await at(10, f.ctx);
 	assert(f.requests.every((r) => r.url.includes('/rest/api/3/')));
 });
-
-test('legacy top-level settings stay declared as hidden parameters', () => {
-	for (const [name, expected] of [
-		['simplify', true],
-		['domain', ''],
-		['visibility', 'all'],
-		['excludedAccountIds', ''],
-		['additionalFields', ''],
-	]) {
-		const property = node.description.properties.find((p) => p.name === name);
-		assert.equal(property.type, 'hidden');
-		assert.equal(property.default, expected);
-	}
+test('Issue mode preserves a requested comment field', async () => {
+	const f = fixture({
+		manual: true,
+		params: { options: { simplify: false, additionalFields: 'comment' } },
+		read: async () => ({
+			issues: [
+				{
+					...issue(),
+					fields: { ...issue().fields, comment: { comments: [{ id: 'requested' }] } },
+					renderedFields: { comment: { comments: [{ id: 'rendered-requested' }] } },
+				},
+			],
+			isLast: true,
+		}),
+	});
+	const output = (await at(10, f.ctx))[0][0].json;
+	assert(f.requests[0].body.fields.includes('comment'));
+	assert.deepEqual(output.issue.fields.comment.comments, [{ id: 'requested' }]);
+	assert.deepEqual(output.issue.renderedFields.comment.comments, [{ id: 'rendered-requested' }]);
 });
+
 test('changing overlap does not reset the polling cursor', async () => {
 	const f = fixture({ params: { options: { overlapMinutes: 5 } } });
 	assert.equal(await at(0, f.ctx), null);
@@ -1307,7 +1284,18 @@ test('OAuth2 fingerprint survives token refresh and refetches sites once on a ca
 		3,
 	);
 });
-test('the API token path resumes state saved by the previous release without a reset', async () => {
+test('API token rotation and output-only options keep the polling cursor', async () => {
+	const f = fixture({ read: async () => ({ issues: [], isLast: true }) });
+	assert.equal(await at(0, f.ctx), null);
+	const activation = f.state.jiraPollState.activation;
+	const fingerprint = f.state.jiraPollState.fingerprint;
+	f.credentials.apiToken = 'rotated-token';
+	f.params.options = { additionalFields: 'priority', excludedAccountIds: 'someone' };
+	assert.equal(await at(10, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, activation);
+	assert.equal(f.state.jiraPollState.fingerprint, fingerprint);
+});
+test('API token path resumes a matching saved cursor without a reset', async () => {
 	const f = fixture({ read: async () => ({ issues: [issue()], isLast: true }) });
 	const { createHash } = require('node:crypto');
 	f.state.jiraPollState = {
@@ -1315,15 +1303,13 @@ test('the API token path resumes state saved by the previous release without a r
 		fingerprint: JSON.stringify({
 			credential: `fixture-credential-${fixtureSequence}`,
 			credentialRevision: createHash('sha256')
-				.update(JSON.stringify([f.credentials.email, f.credentials.apiToken]))
+				.update(JSON.stringify([f.credentials.domain, f.credentials.email]))
 				.digest('hex'),
 			baseUrl: 'https://example.atlassian.net',
 			resource: 'issue',
 			event: 'createdOrUpdated',
 			jql: '',
-			excludedAccountIds: [],
 			publicOnly: false,
-			fields: ['summary', 'description', 'project', 'status', 'created', 'updated'],
 		}),
 		activation: epoch,
 		checkpoint: epoch,
@@ -1331,9 +1317,9 @@ test('the API token path resumes state saved by the previous release without a r
 	};
 	assert.deepEqual(emittedIds(await at(10, f.ctx)), ['1']);
 	assert.equal(f.state.jiraPollState.activation, epoch);
-	assert.equal(f.requests[0].url, 'https://example.atlassian.net/rest/api/3/search/jql');
-	assert.equal(f.requests[0].timeout, 30_000);
-	assert.equal(f.options[0], undefined);
+	assert.equal(f.requests.at(-1).url, 'https://example.atlassian.net/rest/api/3/search/jql');
+	assert.equal(f.requests.at(-1).timeout, 30_000);
+	assert.equal(f.options.at(-1), undefined);
 });
 test('OAuth2 refreshes on 403 first and retries once on a 401 or 404 with that code', async () => {
 	const calls = [];
@@ -1365,4 +1351,27 @@ test('OAuth2 refreshes on 403 first and retries once on a 401 or 404 with that c
 		throw { statusCode: 403 };
 	};
 	await assert.rejects(at(30, f.ctx), /HTTP 403/);
+});
+test('OAuth2 retry caps its timeout to the poll deadline', async () => {
+	const f = fixture({
+		credentialType: 'jiraSoftwareCloudOAuth2Api',
+		credentials: structuredClone(oauthCredentials),
+		params: { authentication: 'oAuth2' },
+		read: oauthServer([{ id: 'cloud-1', url: 'https://example.atlassian.net' }]),
+	});
+	assert.equal(await at(0, f.ctx), null);
+	f.requests.length = 0;
+	f.ctx.getPollBudgetMs = () => 100;
+	let searchAttempts = 0;
+	f.ctx.helpers.httpRequestWithAuthentication = async (_name, request) => {
+		f.requests.push(request);
+		if (request.url.endsWith('/search/jql') && searchAttempts++ === 0) {
+			Date.now = () => epoch + 90;
+			throw { statusCode: 401 };
+		}
+		return { issues: [], isLast: true };
+	};
+	assert.equal(await at(10, f.ctx), null);
+	const attempts = f.requests.filter((request) => request.url.endsWith('/search/jql'));
+	assert.deepEqual(attempts.map((request) => request.timeout), [100, 20]);
 });

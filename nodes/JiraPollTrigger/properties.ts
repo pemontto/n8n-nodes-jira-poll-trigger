@@ -58,11 +58,11 @@ export const properties: INodeProperties[] = [
 				displayOptions: { show: { '/resource': ['comment'] } },
 				options: [
 					{ name: 'All Accessible', value: 'all' },
-					{ name: 'Public Only', value: 'public' },
+					{ name: 'Customer-Visible Only', value: 'public' },
 				],
 				default: 'all',
 				description:
-					'Public only excludes internal comments and comments whose public visibility is unknown',
+					'Customer-visible only includes Jira Service Management comments marked public; internal and unknown visibility are excluded',
 			},
 			{
 				displayName: 'Excluded Account IDs',
@@ -134,21 +134,9 @@ export const properties: INodeProperties[] = [
 			},
 		],
 	},
-	// Legacy top-level settings, superseded by Options. They are declared so a
-	// value still merged by the poll stays visible in the workflow JSON view.
-	{ displayName: 'Simplify', name: 'simplify', type: 'hidden', default: true },
-	{ displayName: 'Jira Domain', name: 'domain', type: 'hidden', default: '' },
-	{ displayName: 'Comment Visibility', name: 'visibility', type: 'hidden', default: 'all' },
-	{
-		displayName: 'Excluded Account IDs',
-		name: 'excludedAccountIds',
-		type: 'hidden',
-		default: '',
-	},
-	{ displayName: 'Fields', name: 'additionalFields', type: 'hidden', default: '' },
 	{
 		displayName:
-			'Activation starts from now. Changing credentials, domain or filters resets this boundary. Manual testing returns up to the test limit from a bounded search without advancing scheduled polling.',
+			'Activation starts from now after Jira confirms the configured JQL and credentials. Changing site, account, JQL, resource or event resets this boundary. Manual testing returns up to the test limit from a bounded search without advancing scheduled polling.',
 		name: 'activationNotice',
 		type: 'notice',
 		default: '',
