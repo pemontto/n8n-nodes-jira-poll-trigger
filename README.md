@@ -1,61 +1,131 @@
-# Jira Poll Trigger
+# n8n-nodes-jira-poll-trigger
 
-A Jira Cloud polling trigger for issues and comments. It reuses n8n's installed Jira Cloud credentials (API token or OAuth2) and needs ordinary issue/comment read access. It does not register webhooks.
+This is an n8n community node. It starts a workflow when an issue or a comment is created or updated in Jira Cloud.
 
-## Readiness
+The built-in Jira Trigger uses webhooks. A webhook needs permission to register webhooks in Jira, and Jira must be able to reach your n8n instance. This node does not need either. It polls Jira on a schedule and asks for the changes since the last poll. It needs only read access to the issues and comments that you want to watch.
 
-This package is an implementation under verification, not ready for production. Activation checks the bounded configured JQL and credentials with Jira before establishing a boundary. The legacy scheduler may still discard state after an empty poll, so use a scheduler that durably commits empty polls. Durable schedulers can run overlapping jobs in separate processes. Both jobs can emit the events they read, and the last state save wins, so events in the overlapped span can be emitted twice. No n8n version or deployment mode is certified by this package yet. Do not use this release to replace customer workflows.
+[n8n](https://n8n.io/) is a [fair-code licensed](https://docs.n8n.io/sustainable-use-license/) workflow automation platform.
 
-Live Jira acceptance also remains pending. A designated test issue and an n8n Jira credential are needed to verify that new comments and edits to old comments advance the parent issue timestamp and become discoverable through JQL. Synthetic fixtures cannot establish that tenant behaviour.
+[Installation](#installation)
+[Operations](#operations)
+[Credentials](#credentials)
+[Compatibility](#compatibility)
+[Usage](#usage)
+[Known limits](#known-limits)
+[Resources](#resources)
+[Version history](#version-history)
 
-## Configuration
+## Installation
 
-Authentication selects one of n8n's built-in Jira Cloud credentials; this package defines none of its own. API Token (the default, and what existing workflows keep using) takes the Jira SW Cloud API credential. OAuth2 takes the Jira SW Cloud OAuth2 API credential, whose Site URL names the tenant. Use an HTTPS tenant domain such as `https://example.atlassian.net`. Set Options → Jira Domain to override the credential's domain, or leave it blank to use the credential domain. One saved credential can serve multiple sites where that account has access. Changing the resolved domain resets polling from now; it does not change the saved credential.
+Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes/installation/) in the n8n community nodes documentation. The package name is `n8n-nodes-jira-poll-trigger`.
 
-With OAuth2 the node resolves the site to its Atlassian cloud ID through `https://api.atlassian.com/oauth/token/accessible-resources` and sends every request to `https://api.atlassian.com/ex/jira/{cloudId}/rest/api/...`. The cloud ID is cached per credential for the life of the process; a lookup that misses the cached list refetches it once before failing. Event IDs and saved state still name the site hostname. The polling boundary is keyed on the credential's site and cloud ID, not on token material, so token refreshes do not reset it. The gateway answers an expired token with 403 or 404 rather than the 401 n8n refreshes on, and hosts up to n8n 2.38 refresh on a single status code and replay the request. The node therefore asks for a refresh on 403 first and, if that attempt fails with 401 or 404, tries once more refreshing on that code; a revoked token still fails visibly. A genuine 403 or 404 costs one refresh before it is reported. The retry timeout is capped to the remaining poll budget. Discovery requests share the poll's request timeout cap.
+## Operations
 
-Choose Issue or Comment, then Created, Updated, or Created or Updated. Standard n8n Poll Times default to every minute. Enter a JQL predicate without a top-level `ORDER BY`; quoted text containing those words is accepted. An empty predicate selects all accessible issues. The node groups the predicate before adding the lower polling timestamp constraint.
+The node has one trigger, Jira Poll Trigger. Select a resource and an event:
 
-Comments default to all accessible visibility. Customer-visible Only includes Jira Service Management comments with `jsdPublic: true`; internal and unknown visibility are excluded. Comma-separated excluded account IDs apply to `author.accountId` for creation and `updateAuthor.accountId` for edits. They do not apply to issue events, because the issue response does not provide an equivalent update author.
+| Resource | Created       | Updated              | Created or Updated |
+| -------- | ------------- | -------------------- | ------------------ |
+| Issue    | A new issue   | A change to an issue | Both               |
+| Comment  | A new comment | An edit to a comment | Both               |
 
-Issue output includes top-level `id`, `key`, `projectKey`, `summary`, `description`, `status`, `created` and `updated`. Options → Fields accepts comma-separated Jira field IDs, including custom field IDs. Overlap defaults to five minutes and can be set between one minute and one day.
+A JQL query limits the issues that the node watches. For comments, the query selects the parent issues.
 
-Manual testing returns up to Test Limit matching events (10 by default, configurable from 1 to 100) without reading or writing scheduled state. It searches parent issues updated within the last 30 days, scans at most 100 issues and two comment pages per issue, and stops when it reaches Test Limit. A sampled comment may have been created long before that period. No result within these limits does not prove that the query has no matching events.
+## Credentials
 
-## Events
+This package has no credential type of its own. It uses the Jira credentials that come with n8n:
 
-Options → Simplify is on by default and returns essential fields for the selected resource. Comment events expose `id`, `body`, `author`, `created`, `updated` and `updateAuthor` at the top level, alongside `issueId`, `issueKey`, `summary` and `status`. Issue events expose their fields directly with no `issue` wrapper. Authors contain only `accountId` and `displayName`; `updateAuthor` is the account Jira records as the comment's last editor. Issue-only output includes issue creation and update timestamps. Use `$json.body` for message content, `$json.id` for the comment ID, `$json.author.displayName` for the writer and `$json.issueKey` for the parent issue. Comment output omits the parent issue description. Options → Output Format selects Rendered HTML (default), Plain Text, Jira Wiki Markup or Atlassian Document Format for both comment `body` and issue `description`. Rendered HTML uses Jira's rendered values, with readable text fallback if absent. Jira Wiki Markup uses Jira Cloud API v2's native string fields for both body and description. It does not convert ADF locally; newer editor features may have no equivalent in wiki markup. Rendered HTML remains the default. ADF preserves structured rich text; plain text removes the structure. Missing descriptions return an empty string. Selected extra issue fields are also top level; reserved event fields take precedence on name collisions. Render HTML only through a renderer that handles untrusted HTML safely.
+- API Token uses the Jira SW Cloud API credential. This is the default.
+- OAuth2 uses the Jira SW Cloud OAuth2 API credential.
 
-Simplified output omits event metadata. In combined mode, creation and update can therefore return identical latest content. Turn Simplify off to distinguish events through `eventType`, `eventId` and `eventTime`, and for the full `issue: { id, key, fields }` and raw `comment`, including the structured Atlassian Document Format body, rendered body, authors and visibility metadata.
+To make an API token, follow [Manage API tokens for your Atlassian account](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/). The Jira account needs permission to browse the projects that you watch.
 
-`eventId` identifies an observed creation or edit, not the Jira comment itself. Its readable format includes the site, resource, issue ID, optional comment ID, event type and epoch timestamp: `example.atlassian.net/comment/123/456/created/1787787964087`. Different sites and edits have distinct IDs. The internal deduplication key remains private to saved state; changing the public format does not replay already seen events.
+## Compatibility
 
-Creation and update are independent checks. A comment created and edited between polls produces a creation event in Created mode, an update event in Updated mode, and both in combined mode. Both contain the latest body returned by Jira. The node cannot reconstruct the original body. Updates require `updated > created`; equal timestamps produce no edit event. The same rules apply to issues.
+The node works with Jira Cloud only. It does not support Jira Server or Jira Data Center.
 
-Each timestamp must fall within the inclusive interval from `max(activation, previous successful poll-start minus overlap)` to the current poll-start. If a comment was created before the poll-start but edited while pages were being read, its creation can emit now and its edit waits for the next poll. Issue Updated can include comment activity when Jira advances the issue's timestamp.
+The node uses version 1 of the n8n nodes API. The tests ran against n8n 2.38.1. On n8n 2.38.0 and later, each poll stays inside the time limit that n8n gives it. For more information, read [How it works](https://github.com/pemontto/n8n-nodes-jira-poll-trigger/blob/main/docs/how-it-works.md#time-limit-for-each-poll).
 
-## Intended state contract and current host limits
+## Usage
 
-The core establishes activation from now without historical emissions, resumes saved state after restart, and resets when the site, API token credential ID or email, JQL, resource or event changes. Switching to a different API-token credential with the same email resets polling too. OAuth2 identity is the credential ID plus site and cloud ID; reconnecting the same credential as another account for the same site is not detected because the trigger does not make an account lookup on every poll. Rotating a token within the same credential, output fields and comment filters do not reset the cursor. Credential identity is represented by a SHA-256 digest; raw tokens and email addresses are not stored in state. Activation validates the configured JQL with one bounded search before establishing or resetting the boundary. The node captures its boundary before network requests and returns replacement state only after every page it needed succeeds. Empty polls return `null`.
+### Set up the trigger
 
-Delivery is ordered by immutable issue creation time and then issue key. Each scan searches from `max(activation, checkpoint - overlap)` through its captured upper bound, using `updated >= since AND created <= until ORDER BY created ASC, key ASC`. With or without a host poll budget, an outage is searched as one interval through poll-start. Hosts without a budget use the same 40,000-key handover as budgeted hosts, so a large outage can continue on the next poll with the same event set. Event timestamps can differ from issue creation order; consumers that need strict chronology sort on `eventTime`. Jira evaluates `created` JQL bounds to the minute, so an interrupted scan saves the rounded creation minute and the issue keys and IDs already handled at that minute. A new search adds the minute lower bound to JQL and skips earlier positions and handled issues in code by key or ID. When a search stops between pages, every resume re-reads the last consumed page after checking its request digest and confirming that the page still contains the last handled issue. It continues after that issue within the page, then follows Jira's next-page token. Jira page tokens must survive between polls for efficient recovery: when they do, a large single-minute drain needs one extra page per resume. If a page takes more than about half the poll budget, a creation minute with 100 or more issues cannot resume and fails visibly with a no-progress error naming the resource and cursor position, because replay leaves no time for the next page. If Jira's page tokens do not survive between polls, the fallback replays the creation minute from its first page; with 3 seconds per page and the 36-second budget, a single creation minute with more than about 1,200 issues also fails visibly with that error. Increase the available poll budget or narrow the JQL to recover. Narrowing the JQL resets the cursor and abandons the unread backlog. Authentication, permission, timeout and rate-limit errors remain visible. Issue keys are never named in JQL. Issues created after `until`, and edits after it, wait for the next interval. Comment reads stop at the first comment created after `until` for the same reason.
+1. Add Jira Poll Trigger to a new workflow.
+2. Select an Authentication method and a Jira credential.
+3. Select a Resource and an Event.
+4. Optional: enter a JQL query, for example `project = SUP AND status != Done`. Do not add `ORDER BY`. If you leave the query empty, the node watches all issues that the account can see.
+5. Set Poll Times. The default is every minute.
+6. Click Test step to see sample events.
+7. Activate the workflow.
 
-Deduplication keys contain resource identity, event type and event timestamp. Creation keys expire by creation time; edit keys expire by update time. Saved keys cover the overlap needed by the next interval. Raising Overlap therefore widens the next interval past the retained keys, and events already delivered inside that wider interval can be emitted again. A hard limit of 40,000 keys also bounds each scan. Reaching it stops the scan and hands over its processed prefix without moving the checkpoint past unread work. Narrowing JQL resets from now and abandons the unread backlog; it is a recovery choice, not a way to replay that backlog.
+When you activate the workflow, the node runs one search to make sure that the query and the credential work. If the search fails, activation fails and shows the error from Jira. The node then starts from the time of activation. It does not send events for older changes.
 
-The node serialises callbacks within one process. That does not coordinate scheduler jobs across processes. If two jobs overlap, both can emit what they read and the last state save wins, so the overlapped span can be emitted twice. The host must persist activation state and commit successful empty polls independently of downstream execution. Legacy scheduling may discard state after an empty poll; reactivation safely starts from the current time, but that can leave an outage gap. The implementation uses only `getWorkflowStaticData('node')`; it does not call internal cursor methods.
+### Options
 
-## Limits of Jira polling
+| Option               | Default        | What it does                                                                                                                                                                         |
+| -------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Comment Visibility   | All Accessible | Customer-Visible Only keeps only the public comments in Jira Service Management.                                                                                                     |
+| Excluded Account IDs | Empty          | A comma-separated list of Atlassian account IDs. The node ignores comments from these accounts, for example your own automation account.                                             |
+| Fields               | Empty          | Extra Jira field IDs to add to each event, for example `priority,customfield_10010`.                                                                                                 |
+| Jira Domain          | Empty          | A site to use instead of the site in the credential.                                                                                                                                 |
+| Output Format        | Rendered HTML  | The format for comment bodies and issue descriptions: Rendered HTML, Plain Text, Jira Wiki Markup, or Atlassian Document Format.                                                     |
+| Overlap (Minutes)    | 5              | Each poll searches again this far back, to find changes that Jira indexed late. The node remembers the events that it sent in this period, so the overlap does not cause duplicates. |
+| Simplify             | On             | Returns a short set of fields. Turn it off to get the full Jira objects and event metadata.                                                                                          |
+| Test Limit           | 10             | The largest number of events that Test step returns, from 1 to 100. Test step searches issues updated in the last 30 days.                                                           |
 
-JQL membership reflects current state. For example, `status = Open` can miss a change that moves an issue out of Open. Search is eventually consistent; indexing delays longer than the overlap can be missed. Issue search uses the lower updated boundary and evaluates event upper bounds locally. Comment mode reads the comments Jira embeds in the search result (the `comment` field) and requests an issue's own comment pages only when the issue holds more comments than the search embedded; the embedded count has been verified equal to the total up to 13 comments. Rendered comment bodies come from `renderedFields.comment` when Jira supplies it, otherwise Rendered HTML falls back to plain text.
+If you use Rendered HTML output, show it only in a place that handles untrusted HTML safely.
 
-The node retries transient read failures up to three times and honours `Retry-After` within a 60-second per-retry wait budget. A longer server wait fails the poll without shortening the requested delay. HTTP status, Jira `errorMessages` and `warningMessages`, and timeout labels are preserved in visible errors. Incomplete, malformed or non-progressing pagination fails the whole scan with the site, resource and checkpoint position.
+### Output
 
-On n8n 2.38.0 and later, scheduled polls honour the host's poll time budget (about 36 seconds on the durable scheduler). Every request's timeout is capped to the time left, no request or retry wait starts once the budget is spent, and a transient failure the budget cannot absorb stops the scan when it has made progress. A stopped scan hands over everything it processed and saves the interval bounds and its creation-minute cursor with the handled issue keys and IDs. In Comment mode it also saves the issue being read, the first unread comment offset (zero if its comments were never reached) and the comment before that offset. Every resume re-reads the last consumed Jira search page, then continues within that page after the last handled issue and follows the next-page token. Jira page tokens must survive between polls for efficient recovery; a resumed scan spends one extra page per resume on replay. If one search page takes more than about half the poll budget, a creation minute with 100 or more issues cannot resume and fails visibly with a no-progress error naming the resource and cursor position because the replay leaves no time for new work. If tokens do not survive between polls, replay starts at the creation minute's first page; at 3 seconds per page and a 36-second budget, a single creation minute with more than about 1,200 issues also fails visibly with that error. Increase the poll budget or narrow the JQL to recover. Narrowing the JQL resets the cursor and abandons the backlog. Authentication, permission, timeout and rate-limit failures keep their HTTP status. A partly read issue is dropped only after Jira confirms the credential still works and the issue lookup returns 404; a 403 or an authentication-related 404 stays visible. The dropped issue ID is saved as a short-lived skip entry so stale search results do not block the stream. The interval closes at its captured upper bound before a new one opens, and the checkpoint never passes unread work. With or without a host budget, the 40,000-key limit stops a scan and hands over its progress for the next poll. Without a budget, the host can run a whole interval in one invocation, so request cost grows with the backlog rather than with a sequence of fifteen-minute searches. An overlap or one issue's unread comments alone that exceeds 40,000 events still cannot drain and polling fails visibly; narrow the JQL to recover, which resets from now. Comment events resumed across polls carry the issue fields from when the issue was first fetched. Stops after a request failure are logged as warnings; a poll that stops before reading anything new fails visibly with the site, resource and position. Manual tests are unchanged.
+With Simplify on, a comment event looks like this:
 
-This is not exactly-once delivery. Multiple edits between reads can collapse into one update, equal-timestamp edits cannot be distinguished, and deleted or inaccessible comments cannot be recovered. Formatting, RT mapping, attachments and writes remain downstream. Existing workflows that first derive JQL from RT are not necessarily replaceable with a trigger.
+```json
+{
+	"id": "10421",
+	"body": "<p>The fix is deployed.</p>",
+	"author": { "accountId": "5b10a2844c20165700ede21g", "displayName": "Alex Example" },
+	"created": "2026-09-01T10:15:00.000+0000",
+	"updated": "2026-09-01T10:15:00.000+0000",
+	"updateAuthor": { "accountId": "5b10a2844c20165700ede21g", "displayName": "Alex Example" },
+	"issueId": "10087",
+	"issueKey": "SUP-42",
+	"summary": "Login page returns an error",
+	"status": "In Progress"
+}
+```
 
-## Development
+An issue event has `id`, `key`, `projectKey`, `summary`, `description`, `status`, `created`, `updated`, and any extra fields that you selected.
 
-Run `npm install`, `npm test`, `npm run lint` and `npm run package:check` from this directory. Tests use synthetic data and do not contact Jira. Build output is the only runtime code included in the package; test captures and credentials are excluded. Nothing has been published or deployed.
+With Simplify off, each event also has `eventType`, `eventId`, and `eventTime`. Use `eventType` to tell a creation from an update when you select Created or Updated. Use `eventId` to remove duplicates in later steps.
 
-Simplified Issue output includes `projectKey` from Jira's `fields.project.key`, independently of the issue key. If Jira omits it, the value is an empty string.
+### Example: send new comments to Slack
+
+1. Set Resource to Comment and Event to Created.
+2. Set JQL to `project = SUP`.
+3. In Options, set Output Format to Plain Text.
+4. In Excluded Account IDs, enter the account ID of your automation user. This stops a loop when the workflow itself writes comments.
+5. Add a Slack node after the trigger. Set the message text to `{{ $json.issueKey }}: {{ $json.author.displayName }} wrote {{ $json.body }}`.
+
+## Known limits
+
+- The node polls, so events arrive up to one poll interval late.
+- If a comment changes several times between two polls, you get one update event with the latest text. The node cannot see the earlier text.
+- JQL uses the current state of an issue. For example, `status = Open` misses the change that moves an issue out of Open. If you need that change, use a wider query and filter in the workflow.
+- Deleted issues and deleted comments do not produce events.
+- If you change the site, credential account, JQL, resource, or event, the node starts again from the time of the change. Changes made before then do not produce events.
+- If n8n runs two polls of the same workflow at the same time, some events can arrive twice. Use `eventId` to remove duplicates if this matters.
+- Some older n8n schedulers can lose the saved position after a poll that finds nothing. The node then starts again from the next poll, and changes in the gap do not produce events.
+
+[How it works](https://github.com/pemontto/n8n-nodes-jira-poll-trigger/blob/main/docs/how-it-works.md) explains the polling window, recovery after an outage, and the limits for very large backlogs.
+
+## Resources
+
+- [n8n community nodes documentation](https://docs.n8n.io/integrations/#community-nodes)
+- [Jira Cloud REST API: search for issues using JQL](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/)
+- [JQL reference](https://support.atlassian.com/jira-software-cloud/docs/use-advanced-search-with-jira-query-language-jql/)
+- [How it works](https://github.com/pemontto/n8n-nodes-jira-poll-trigger/blob/main/docs/how-it-works.md)
+
+## Version history
+
+### 0.1.0
+
+This is the first release. The node has full automated tests against a simulated Jira. Tests against a live Jira site are not complete. Try it on a test workflow before you depend on it.
