@@ -49,8 +49,9 @@ function author(value: unknown): Record<string, unknown> | null {
 	const source = value as Record<string, unknown>;
 
 	return Object.fromEntries(
-		['accountId', 'displayName']
-			.flatMap((key) => (source[key] !== undefined ? [[key, source[key]]] : [])),
+		['accountId', 'displayName'].flatMap((key) =>
+			source[key] !== undefined ? [[key, source[key]]] : [],
+		),
 	);
 }
 
@@ -64,6 +65,12 @@ export function formatEvent(
 		// SAFETY: PollEvent declares only string-named properties; raw output returns that same object.
 		return event as PollEvent & Record<string, unknown>;
 	}
+
+	const metadata = {
+		eventId: event.eventId,
+		eventType: event.eventType,
+		eventTime: event.eventTime,
+	};
 
 	const { fields } = event.issue;
 
@@ -79,7 +86,15 @@ export function formatEvent(
 			? ((fields.status as Record<string, unknown>).name ?? '')
 			: fields.status;
 
+	const additionalFields = Object.fromEntries(
+		Object.entries(fields).filter(
+			([key]) =>
+				!['summary', 'description', 'project', 'status', 'created', 'updated'].includes(key),
+		),
+	);
+
 	const issue: Record<string, unknown> = {
+		...additionalFields,
 		id: event.issue.id,
 		key: event.issue.key,
 		projectKey,
@@ -88,23 +103,8 @@ export function formatEvent(
 		status: status ?? '',
 	};
 
-	const additionalFields = Object.fromEntries(
-		Object.entries(fields).filter(
-			([key]) =>
-				!['summary', 'description', 'project', 'status', 'created', 'updated'].includes(key),
-		),
-	);
-
-	Object.assign(issue, additionalFields, {
-		id: event.issue.id,
-		key: event.issue.key,
-		projectKey,
-		summary: fields.summary ?? '',
-		description: content(fields.description, event.issue.renderedFields?.description, format),
-		status: status ?? '',
-	});
-
-	if (!event.comment) return { ...issue, created: fields.created, updated: fields.updated };
+	if (!event.comment)
+		return { ...issue, created: fields.created, updated: fields.updated, ...metadata };
 
 	return {
 		issueId: event.issue.id,
@@ -135,5 +135,6 @@ export function formatEvent(
 		updated: event.comment.updated,
 		author: author(event.comment.author),
 		updateAuthor: author(event.comment.updateAuthor),
+		...metadata,
 	};
 }

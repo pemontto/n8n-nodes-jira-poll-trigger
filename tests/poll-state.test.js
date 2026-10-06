@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
 	scanPoll,
-	serializePoll,
+	PollBudgetExhausted,
 	MAX_DEDUP_KEYS,
 	JiraReadError,
 } = require('../dist/nodes/JiraPollTrigger/poll-state.js');
@@ -28,7 +28,7 @@ const comment = (created = 1100, updated = 1200, extra = {}) => ({
 	...extra,
 });
 const state = () => ({
-	version: 1,
+	version: 2,
 	fingerprint: 'a',
 	activation: 1000,
 	checkpoint: 1000,
@@ -279,113 +279,177 @@ test('ordinary restart resumes serialised saved state', async () => {
 	assert.deepEqual(result.events, []);
 	assert.equal(result.state.activation, 1000);
 });
-test('the key cap hands over a no-budget prefix instead of discarding progress', async () => {
+test('recent keys evict oldest entries with one warning and keep reading', async () => {
 	const previous = state();
 	const original = structuredClone(previous);
+	const warnings = [];
 	const result = await poll([], {
 		state: previous,
+		warn: (message) => warnings.push(message),
 		source: {
 			async *issues() {
 				yield issue;
 			},
 			async *comments() {
-				for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
+				for (let i = 0; i < MAX_DEDUP_KEYS + 3; i++) yield comment(1200, 1200, { id: String(i) });
 			},
 		},
 	});
-	assert.equal(result.events.length, MAX_DEDUP_KEYS);
-	assert.match(result.stopped, /40,000/);
-	assert.equal(result.state.checkpoint, previous.checkpoint);
-	assert.ok(result.state.window.partial);
+	assert.equal(result.events.length, MAX_DEDUP_KEYS + 3);
+	assert.equal(result.stopped, undefined);
+	assert.equal(result.state.checkpoint, 1300);
+	assert.equal(result.state.seen.length, MAX_DEDUP_KEYS);
+	assert.equal(JSON.parse(result.state.seen[0].key)[2], '3');
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /40,000.*evicted/);
 	assert.deepEqual(previous, original);
 });
-test('under a budget the cap stops the scan with its progress saved instead of evicting keys or mutating saved state', async () => {
-	const previous = state();
-	const result = await poll([], {
-		state: previous,
-		budgeted: true,
+
+test('real Jira failures after progress always throw with status and leave saved state untouched', async () => {
+	for (const status of [401, 403, 404, 429, 503]) {
+		const previous = state();
+		const original = structuredClone(previous);
+		await assert.rejects(
+			scanPoll({
+				config: { ...config, resource: 'issue' },
+				state: previous,
+				pollStart: 1300,
+				source: {
+					async *issues() {
+						yield issue;
+						throw new JiraReadError(`Jira read failed (HTTP ${status})`, status, {
+							transient: status >= 429,
+						});
+					},
+					async *comments() {},
+				},
+			}),
+			(error) => error instanceof JiraReadError && error.status === status,
+		);
+		assert.deepEqual(previous, original);
+	}
+});
+
+test('a deadline hands over exact milliseconds and handled IDs, then resumes timestamp ties', async () => {
+	const issues = [
+		{ ...issue, fields: { created: iso(1101), updated: iso(1101) } },
+		{ id: '2', key: 'ALPHA-1', fields: { created: iso(1101), updated: iso(1101) } },
+		{ id: '3', key: 'TEST-3', fields: { created: iso(1102), updated: iso(1102) } },
+	];
+	const options = { config: { ...config, resource: 'issue' }, state: state(), pollStart: 1300 };
+	const first = await scanPoll({
+		...options,
 		source: {
 			async *issues() {
-				yield issue;
+				yield issues[0];
+				yield issues[1];
+				throw new PollBudgetExhausted('deadline');
 			},
-			async *comments() {
-				for (let i = 0; i <= MAX_DEDUP_KEYS; i++) yield comment(1200, 1200, { id: String(i) });
-			},
+			async *comments() {},
 		},
 	});
-	assert.equal(result.events.length, MAX_DEDUP_KEYS);
-	assert.match(result.stopped, /40,000/);
-	assert.equal(result.state.checkpoint, 1000);
-	assert.equal(result.state.window.partial.issue.id, '1');
-	assert.ok(result.state.seen.length <= MAX_DEDUP_KEYS);
-	assert.deepEqual(previous, state());
-});
-test('a transient Jira read failure after earlier issue events hands over the processed prefix', async () => {
-	const previous = state();
-	const result = await scanPoll({
-		config: { ...config, resource: 'issue' },
-		state: previous,
-		pollStart: 1300,
-		budgeted: true,
+	assert.equal(first.state.window.afterCreated, 1101);
+	assert.deepEqual(first.state.window.afterIds, ['1', '2']);
+	assert.deepEqual(
+		Object.keys(first.state.window).filter((key) => /Token|Keys|afterId$/.test(key)),
+		[],
+	);
+	const second = await scanPoll({
+		...options,
+		state: first.state,
 		source: {
-			async *issues() {
-				yield issue;
-				throw new JiraReadError('Jira read failed (HTTP 429). Retry the poll.', 429, {
-					transient: true,
-				});
+			async *issues(lower, read) {
+				assert.equal(read.afterCreated, 1101);
+				assert.equal(read.createdBefore, 1300);
+				yield { ...issues[0], key: 'RENAMED-99' };
+				yield issues[1];
+				yield issues[2];
 			},
 			async *comments() {},
 		},
 	});
 	assert.deepEqual(
-		result.events.map((event) => event.eventType),
-		['issue.created', 'issue.updated'],
+		second.events.map((event) => event.issue.id),
+		['3'],
 	);
-	assert.match(result.stopped, /HTTP 429/);
-	assert.equal(result.stopError.status, 429);
-	assert.equal(result.state.checkpoint, previous.checkpoint);
-	assert.deepEqual(result.state.window.afterKeys, ['TEST-1']);
-	assert.deepEqual(previous, state());
+	assert.equal(second.state.checkpoint, 1300);
+	assert.equal(second.state.window, undefined);
 });
+
+test('a finite page cap saves a prefix and exact cursor until a fake Jira backlog drains', async () => {
+	const { JiraTransport } = require('../dist/nodes/JiraPollTrigger/transport');
+	const issues = Array.from({ length: 5 }, (_, index) => ({
+		id: String(index + 1),
+		key: `TEST-${index + 1}`,
+		fields: { created: iso(1101 + index), updated: iso(1101 + index) },
+	}));
+	const requests = [];
+	const transport = new JiraTransport(async (request) => {
+		requests.push(request);
+		const lower = Number(/updated >= (\d+)/.exec(request.body.jql)[1]);
+		const upper = Number(/created <= (\d+)/.exec(request.body.jql)[1]);
+		const after = Number(/created >= (\d+)/.exec(request.body.jql)?.[1] ?? 0);
+		const matching = issues.filter(
+			(issue) =>
+				Date.parse(issue.fields.updated) >= lower &&
+				Date.parse(issue.fields.created) <= upper &&
+				Date.parse(issue.fields.created) >= after,
+		);
+		const offset = Number(request.body.nextPageToken ?? 0);
+		return {
+			issues: matching.slice(offset, offset + 2),
+			...(offset + 2 < matching.length ? { nextPageToken: String(offset + 2) } : {}),
+		};
+	});
+	const source = {
+		async *issues(lower, read) {
+			yield* transport.searchIssues('', lower, [], { ...read, maxPages: 1 });
+		},
+		async *comments() {},
+	};
+	let saved = state();
+	const emitted = [];
+	for (let index = 0; index < 4; index++) {
+		const result = await scanPoll({
+			config: { ...config, resource: 'issue' },
+			state: saved,
+			pollStart: 1300,
+			source,
+		});
+		emitted.push(...result.events.map((event) => event.issue.id));
+		saved = result.state;
+		if (index < 3) {
+			assert.equal(result.stopped, 'page cap');
+			assert.equal(saved.checkpoint, 1000);
+			assert.equal(saved.window.afterCreated, 1102 + index);
+			assert.deepEqual(saved.window.afterIds, [String(2 + index)]);
+		} else {
+			assert.equal(saved.checkpoint, 1300);
+			assert.equal(saved.window, undefined);
+		}
+	}
+	assert.deepEqual(emitted, ['1', '2', '3', '4', '5']);
+	assert.equal(requests.length, 4);
+	assert(requests.every((request) => request.body.nextPageToken === undefined));
+});
+
+test('unknown and older state versions reset to a fresh activation without migration', async () => {
+	for (const version of [undefined, 1, 3, '2']) {
+		const result = await poll([], { state: { version, seen: null } });
+		assert.deepEqual(result.events, []);
+		assert.deepEqual(result.state, {
+			version: 2,
+			fingerprint: 'a',
+			activation: 1300,
+			checkpoint: 1300,
+			seen: [],
+		});
+	}
+});
+
 test('stale polls and corrupt state fail explicitly', async () => {
 	await assert.rejects(poll([], { state: { ...state(), checkpoint: 1500 } }), /Stale/);
 	await assert.rejects(poll([], { state: { ...state(), seen: null } }), /Invalid saved/);
-});
-test('slow polls serialize, reload current state, and failures release the lock', async () => {
-	let saved = state();
-	const order = [];
-	let release;
-	const held = new Promise((resolve) => {
-		release = resolve;
-	});
-	const first = serializePoll('node', async () => {
-		order.push('first start');
-		await held;
-		const result = await poll([comment()], { state: saved });
-		saved = result.state;
-		order.push('first end');
-		return result;
-	});
-	const second = serializePoll('node', async () => {
-		order.push('second start');
-		const result = await poll([comment()], { state: saved, pollStart: 1400 });
-		saved = result.state;
-		return result;
-	});
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.deepEqual(order, ['first start']);
-	release();
-	const [a, b] = await Promise.all([first, second]);
-	assert.equal(a.events.length, 2);
-	assert.equal(b.events.length, 0);
-	assert.equal(saved.checkpoint, 1400);
-	await assert.rejects(
-		serializePoll('node', async () => {
-			throw new Error('failed');
-		}),
-		/failed/,
-	);
-	assert.equal(await serializePoll('node', async () => 42), 42);
 });
 
 test('invalid resource and event values fail before activation', async () => {
@@ -395,10 +459,9 @@ test('invalid resource and event values fail before activation', async () => {
 			/Invalid Jira polling resource or event/,
 		);
 });
-test('cap also bounds deduplication while scanning an old backlog', async () => {
+test('an old backlog completes after cache eviction and expires keys by the overlap', async () => {
 	const result = await poll([], {
 		pollStart: 10000,
-		budgeted: true,
 		source: {
 			async *issues() {
 				yield issue;
@@ -408,8 +471,9 @@ test('cap also bounds deduplication while scanning an old backlog', async () => 
 			},
 		},
 	});
-	assert.equal(result.events.length, MAX_DEDUP_KEYS);
-	assert.ok(result.state.window);
+	assert.equal(result.events.length, MAX_DEDUP_KEYS + 1);
+	assert.equal(result.state.window, undefined);
+	assert.deepEqual(result.state.seen, []);
 });
 
 test('public event IDs are readable, tenant-scoped and independent of stored dedup keys', async () => {

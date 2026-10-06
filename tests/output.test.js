@@ -40,6 +40,9 @@ test('simple comment output defaults to rendered HTML and keeps only essential n
 	assert.deepEqual(
 		Object.keys(out).sort(),
 		[
+			'eventId',
+			'eventType',
+			'eventTime',
 			'issueId',
 			'issueKey',
 			'summary',
@@ -167,3 +170,19 @@ test('issue projectKey uses Jira project data and cannot be overwritten by an ex
 	delete copy.issue.fields.project;
 	assert.equal(formatEvent(copy, true).projectKey, '');
 });
+
+for (const simplify of [true, false])
+	for (const format of ['rendered', 'text', 'adf', 'wiki'])
+		for (const resource of ['issue', 'comment'])
+			test(`${resource} ${simplify ? 'simple' : 'raw'} ${format} keeps stable top-level event metadata`, () => {
+				const copy = structuredClone(event);
+				if (resource === 'issue') delete copy.comment;
+				copy.issue.fields.eventId = 'wrong';
+				copy.issue.fields.eventType = 'wrong';
+				copy.issue.fields.eventTime = 'wrong';
+				if (format === 'wiki') copy.comment && (copy.comment.body = '*body*');
+				const out = formatEvent(copy, simplify, format);
+				assert.equal(out.eventId, event.eventId);
+				assert.equal(out.eventType, event.eventType);
+				assert.equal(out.eventTime, event.eventTime);
+			});

@@ -16,7 +16,6 @@ import { properties } from './properties';
 import { formatEvent } from './output';
 import {
 	scanPoll,
-	serializePoll,
 	type CommentReadOptions,
 	type PollConfig,
 	type PollState,
@@ -44,12 +43,12 @@ const oauthRefreshOn = (status: number): IAdditionalCredentialOptions => ({
 });
 
 /** n8n 2.38.0 added getPollBudgetMs to IPollFunctions; older hosts and typings lack it. */
-function pollDeadline(context: IPollFunctions): number | undefined {
+function pollDeadline(context: IPollFunctions): number {
 	if (!('getPollBudgetMs' in context) || typeof context.getPollBudgetMs !== 'function')
-		return undefined;
+		return Date.now() + 5 * 60_000;
 	const budget: unknown = context.getPollBudgetMs();
 
-	if (typeof budget !== 'number' || !Number.isFinite(budget)) return undefined;
+	if (typeof budget !== 'number' || !Number.isFinite(budget)) return Date.now() + 5 * 60_000;
 
 	return Date.now() + Math.max(0, budget);
 }
@@ -64,6 +63,10 @@ function commaList(value: unknown): string[] {
 		),
 	].sort();
 }
+
+const busy = new Set<string>();
+
+const pendingBaselines = new Map<string, PollState>();
 
 export class JiraPollTrigger implements INodeType {
 	description: INodeTypeDescription = {
@@ -111,7 +114,17 @@ export class JiraPollTrigger implements INodeType {
 			throw new NodeOperationError(this.getNode(), 'Select a valid Output Format');
 		const key = `${this.getWorkflow().id}:${this.getNode().id}`;
 
-		return await serializePoll(key, async () => {
+		if (!manual && busy.has(key)) {
+			this.logger.warn('Jira Poll Trigger skipped an overlapping poll', {
+				node: this.getNode().name,
+			});
+
+			return null;
+		}
+
+		if (!manual) busy.add(key);
+
+		try {
 			const pollStart = Date.now();
 
 			const prepared = await (async () => {
@@ -162,16 +175,9 @@ export class JiraPollTrigger implements INodeType {
 						const initialTimeout = Number(request.timeout);
 						const remaining = deadline === undefined ? initialTimeout : deadline - Date.now();
 
-						if (remaining <= 0)
-							// scanPoll consumes this sentinel and hands over saved progress.
-							// eslint-disable-next-line @n8n/community-nodes/require-node-api-error, n8n-nodes-base/node-execute-block-wrong-error-thrown
-							throw new PollBudgetExhausted(
-								'OAuth refresh deadline',
-								status,
-								retry.details,
-								retry.code,
-								retry.timedOut,
-							);
+						// A real authentication failure stays an error even at our deadline.
+						// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+						if (remaining <= 0) throw error;
 
 						return await attempt(status, Math.min(initialTimeout, remaining));
 					}
@@ -298,19 +304,36 @@ export class JiraPollTrigger implements INodeType {
 							return;
 						}
 
-						for await (const comment of transport.comments(issue.id, {
-							...(manual ? { maxPages: 2 } : {}),
-							...read,
-						}))
-							yield comment;
+						try {
+							for await (const comment of transport.comments(issue.id, {
+								...(manual ? { maxPages: 2 } : {}),
+								...read,
+							}))
+								yield comment;
+						} catch (error) {
+							if (manual && error instanceof PollBudgetExhausted && error.reason === 'page cap')
+								return;
+							// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+							throw error;
+						}
 					},
 				};
 
 				const data = manual ? undefined : this.getWorkflowStaticData('node');
 				// SAFETY: jiraPollState is written below from scanPoll's PollState result and validated by scanPoll before scanning.
-				const before = data?.jiraPollState as PollState | undefined;
+				const saved = data?.jiraPollState as PollState | undefined;
+				const baselineKey = JSON.stringify([key, fingerprint]);
+				const committed = saved?.version === 2 && saved.fingerprint === fingerprint;
 
-				if (!manual && before?.fingerprint !== fingerprint) {
+				if (committed) pendingBaselines.delete(baselineKey);
+
+				const before = committed
+					? saved
+					: !manual && !saved
+						? pendingBaselines.get(baselineKey)
+						: undefined;
+
+				if (!manual && !before) {
 					try {
 						await authenticated(
 							`${apiBaseUrl}/rest/api/${simplify && outputFormat === 'wiki' ? 2 : 3}/search/jql`,
@@ -340,8 +363,7 @@ export class JiraPollTrigger implements INodeType {
 						const errors = body?.errors;
 
 						const jiraMessage = String(
-							(error instanceof PollBudgetExhausted && error.details ? error.details : undefined) ??
-								body?.message ??
+							body?.message ??
 								(Array.isArray(messages) ? messages[0] : undefined) ??
 								(errors && typeof errors === 'object'
 									? Object.values(errors as IDataObject)[0]
@@ -357,19 +379,26 @@ export class JiraPollTrigger implements INodeType {
 					}
 				}
 
-				return { config, before, source, manualLimit, data };
+				return { config, before, source, manualLimit, data, baselineKey };
 			})().catch((error) => {
 				// Activation API errors retain Jira's message and HTTP status.
 				if (error instanceof NodeApiError) throw error;
 
 				if (error instanceof NodeOperationError) throw error;
+				const details = retryDetails(error);
+
+				if (details.status !== undefined || details.timedOut)
+					throw new NodeApiError(this.getNode(), error as JsonObject, {
+						message: error instanceof Error ? error.message : 'Jira polling failed',
+						httpCode: details.status !== undefined ? String(details.status) : String(details.code),
+					});
 				throw new NodeOperationError(
 					this.getNode(),
 					error instanceof Error ? error.message : 'Jira polling failed',
 				);
 			});
 
-			const { config, before, source, manualLimit, data } = prepared;
+			const { config, before, source, manualLimit, data, baselineKey } = prepared;
 
 			try {
 				const result = await scanPoll({
@@ -379,7 +408,7 @@ export class JiraPollTrigger implements INodeType {
 					source,
 					manual,
 					manualLimit,
-					budgeted: deadline !== undefined,
+					warn: (message) => this.logger.warn(message, { node: this.getNode().name }),
 				});
 
 				// Format before committing: a formatting failure must not advance the checkpoint.
@@ -396,13 +425,10 @@ export class JiraPollTrigger implements INodeType {
 
 				if (!manual && data && result.state) {
 					// The runtime owns durable commit. Do not call its internal cursor methods.
-					if (data.jiraPollState !== before)
-						throw new NodeOperationError(
-							this.getNode(),
-							'Polling state changed during this poll; retry without advancing the checkpoint',
-						);
 					// SAFETY: scanPoll constructs PollState from JSON-compatible checkpoint, cursor, and Jira payload fields.
 					data.jiraPollState = result.state as PollState & IDataObject;
+
+					if (!before) pendingBaselines.set(baselineKey, result.state);
 
 					if (result.dropped !== undefined)
 						this.logger.warn(
@@ -410,7 +436,7 @@ export class JiraPollTrigger implements INodeType {
 							{ node: this.getNode().name },
 						);
 
-					// A stop on a failed request is quiet on the output; say so in the log.
+					// Page-cap stops hand over progress and remain visible in the log.
 					if (result.stopped !== undefined && result.stopped !== 'deadline')
 						this.logger.warn(
 							`Jira Poll Trigger stopped early (${result.stopped}); progress saved, continuing next poll`,
@@ -446,6 +472,8 @@ export class JiraPollTrigger implements INodeType {
 					error instanceof Error ? error.message : 'Jira polling failed',
 				);
 			}
-		});
+		} finally {
+			if (!manual) busy.delete(key);
+		}
 	}
 }

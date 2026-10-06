@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { sleep } from 'n8n-workflow';
 import {
 	JiraReadError,
@@ -104,9 +103,8 @@ export function buildPollingJql(
 	if (/\border\s+by\b/i.test(visible))
 		throw new Error('Remove the top-level ORDER BY clause from JQL.');
 
-	// Creation time is immutable and Jira compares date bounds at minute
-	// precision. The poller skips processed keys in code so stale keys are never
-	// sent back to Jira, including keys for issues that are now missing.
+	// Jira accepts exact epoch milliseconds. Creation time is immutable; the
+	// scanner skips handled IDs at that timestamp without naming stale keys.
 	const bound = `updated >= ${lowerBound}${
 		createdBefore === undefined ? '' : ` AND created <= ${createdBefore}`
 	}${afterCreated === undefined ? '' : ` AND created >= ${afterCreated}`}`;
@@ -232,7 +230,12 @@ export class JiraTransport {
 
 	private async request(request: Omit<ReadRequest, 'timeout'>): Promise<JsonRecord> {
 		for (let attempt = 0; ; attempt++) {
-			const timeout = requestTimeout(this.deadline, this.now());
+			const requestStarted = this.now();
+			const timeout = requestTimeout(this.deadline, requestStarted);
+
+			const deadlineTimeout =
+				this.deadline !== undefined && timeout === this.deadline - requestStarted;
+
 			let result: unknown;
 
 			try {
@@ -275,24 +278,27 @@ export class JiraTransport {
 					if (Number.isFinite(requested)) delay = Math.max(delay, requested);
 				}
 
-				// A transient failure the budget cannot absorb, including a timeout the
-				// capped request hit, stops the scan with its progress kept. scanPoll
-				// handles this error; the node wraps everything else.
-				if (this.deadline !== undefined && this.now() + delay >= this.deadline)
+				// A timeout from our capped deadline can stop. HTTP failures retain their identity.
+				if (
+					timedOut &&
+					deadlineTimeout &&
+					status === undefined &&
+					this.deadline !== undefined &&
+					this.now() >= this.deadline
+				)
+					// scanPoll handles only this sentinel; HTTP failures remain JiraReadError.
 					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
-					throw new PollBudgetExhausted(
-						Number.isInteger(status) ? `HTTP ${status}` : String(code ?? 'request failed'),
-						status,
-						details,
-						code,
-						timedOut,
-					);
+					throw new PollBudgetExhausted('deadline');
+
+				if (this.deadline !== undefined && this.now() + delay >= this.deadline) throw failure();
 
 				if (attempt >= this.maxRetries) throw failure();
 
 				// Do not shorten a server-requested wait just to fit the retry budget.
 				if (delay > this.maxRetryDelayMs) throw failure();
 				await this.sleep(delay);
+
+				if (this.deadline !== undefined && this.now() >= this.deadline) throw failure();
 				continue;
 			}
 
@@ -323,10 +329,9 @@ export class JiraTransport {
 	}
 
 	private pageLimit(limits: PageLimits): number {
-		const limit = limits.maxPages ?? Infinity;
+		const limit = limits.maxPages ?? 1000;
 
-		if (limit !== Infinity && (!Number.isInteger(limit) || limit < 1))
-			throw new Error('Invalid manual page limit.');
+		if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Invalid Jira page limit.');
 
 		return limit;
 	}
@@ -337,21 +342,19 @@ export class JiraTransport {
 		fields: string[],
 		limits: SearchOptions = {},
 	): AsyncGenerator<Issue> {
-		let afterCreated = limits.afterCreated;
-
-		let jql = buildPollingJql(
+		const jql = buildPollingJql(
 			predicate,
 			lowerBound,
 			limits.direction,
-			afterCreated,
+			limits.afterCreated,
 			limits.createdBefore,
 		);
 
 		const limit = this.pageLimit(limits);
 		const path = `/rest/api/${this.apiVersion}/search/jql`;
 
-		const searchBody = (pageToken?: string, searchJql = jql): JsonRecord => ({
-			jql: searchJql,
+		const searchBody = (pageToken?: string): JsonRecord => ({
+			jql,
 			fields: [
 				...new Set([
 					'created',
@@ -366,14 +369,9 @@ export class JiraTransport {
 			...(pageToken ? { nextPageToken: pageToken } : {}),
 		});
 
-		const requestKey = (searchJql = jql) =>
-			createHash('sha256')
-				.update(JSON.stringify({ path, body: searchBody(undefined, searchJql) }))
-				.digest('hex');
-
 		const tokens = new Set<string>();
 		const issueIds = new Set<string>();
-		let nextPageToken = limits.pageToken;
+		let nextPageToken: string | undefined;
 
 		const isIssue = (value: unknown): value is Issue =>
 			record(value) &&
@@ -393,98 +391,16 @@ export class JiraTransport {
 			return issues;
 		};
 
-		const requestPage = (pageToken?: string, searchJql = jql) =>
+		const requestPage = (pageToken?: string) =>
 			this.request({
 				method: 'POST',
 				path,
-				body: searchBody(pageToken, searchJql),
+				body: searchBody(pageToken),
 			});
 
-		let savedPageRequested = limits.resumeWithPageToken === true || nextPageToken !== undefined;
-
-		if (
-			limits.resumeWithPageToken === true &&
-			(limits.pageTokenLastKey === undefined || limits.pageTokenRequestKey === undefined)
-		)
-			throw new Error('Invalid saved search page resume.');
-
-		const discardSavedPage = (reason: 'request-mismatch' | 'rejected' | 'position-mismatch') => {
-			limits.pageTokenFallback?.(reason);
-			savedPageRequested = false;
-			nextPageToken = undefined;
-			tokens.clear();
-			issueIds.clear();
-			afterCreated = limits.fallbackAfterCreated ?? limits.afterCreated;
-			jql = buildPollingJql(
-				predicate,
-				lowerBound,
-				limits.direction,
-				afterCreated,
-				limits.createdBefore,
-			);
-		};
-
-		if (
-			savedPageRequested &&
-			limits.pageTokenRequestKey !== undefined &&
-			limits.pageTokenRequestKey !== requestKey()
-		)
-			discardSavedPage('request-mismatch');
-
-		if (nextPageToken !== undefined) {
-			if (typeof nextPageToken !== 'string' || !nextPageToken)
-				throw new Error('Invalid search continuation.');
-			tokens.add(nextPageToken);
-		}
-
 		for (let page = 0; page < limit; page++) {
-			let requestPageToken = nextPageToken;
-			let validateSavedPageToken = page === 0 && savedPageRequested;
-			let result: JsonRecord;
-
-			try {
-				result = await requestPage(requestPageToken);
-			} catch (error) {
-				const status =
-					error instanceof JiraReadError || error instanceof PollBudgetExhausted
-						? error.status
-						: retryDetails(error).status;
-
-				if (
-					page !== 0 ||
-					requestPageToken === undefined ||
-					(status !== 400 && status !== 404 && status !== 410)
-				)
-					// The node entry point wraps the preserved Jira error after scan-state handling.
-					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
-					throw error;
-				discardSavedPage('rejected');
-				requestPageToken = undefined;
-				validateSavedPageToken = false;
-				result = await requestPage();
-			}
-
-			let pageIssues = validateIssues(result);
-			let savedBoundaryIndex = -1;
-
-			if (validateSavedPageToken && limits.pageTokenLastKey !== undefined) {
-				savedBoundaryIndex = pageIssues.findIndex((issue) => {
-					if (issue.key !== limits.pageTokenLastKey) return false;
-
-					if (limits.pageTokenLastCreated === undefined) return true;
-					const created = Date.parse(issue.fields.created ?? '');
-
-					return Number.isFinite(created) && created === limits.pageTokenLastCreated;
-				});
-
-				if (savedBoundaryIndex < 0) {
-					discardSavedPage('position-mismatch');
-					requestPageToken = undefined;
-					validateSavedPageToken = false;
-					result = await requestPage();
-					pageIssues = validateIssues(result);
-				} else limits.pageTokenResume?.();
-			}
+			const result = await requestPage(nextPageToken);
+			const pageIssues = validateIssues(result);
 
 			const warningValues = [result.warnings, result.warningMessages].filter(
 				(value) => value !== undefined,
@@ -497,22 +413,12 @@ export class JiraTransport {
 				throw new Error(
 					'Jira search returned warnings and may be incomplete. Narrow the JQL before retrying.',
 				);
-			// `isLast` is being retired from the Jira search response. Prefer the
-			// token key when it is present and treat `isLast` as a cross-check; a
-			// response carrying neither could be a truncated page, so fail.
-			const tokenReturned = 'nextPageToken' in result;
 
-			const isLast = tokenReturned
-				? result.nextPageToken === undefined ||
-					result.nextPageToken === null ||
-					result.nextPageToken === ''
-				: result.isLast;
+			const isLast =
+				result.nextPageToken === undefined ||
+				result.nextPageToken === null ||
+				result.nextPageToken === '';
 
-			if (
-				typeof isLast !== 'boolean' ||
-				(tokenReturned && typeof result.isLast === 'boolean' && result.isLast !== isLast)
-			)
-				throw new Error('Jira returned invalid search pagination.');
 			let followingPageToken: string | undefined;
 
 			if (!isLast) {
@@ -527,39 +433,18 @@ export class JiraTransport {
 				tokens.add(followingPageToken);
 			}
 
-			const pageIssuesAfterSavedPosition =
-				page === 0 && validateSavedPageToken
-					? pageIssues.slice(savedBoundaryIndex + 1)
-					: pageIssues;
-
-			for (const issue of pageIssuesAfterSavedPosition) {
+			for (const issue of pageIssues) {
 				if (issueIds.has(issue.id))
 					throw new Error('Jira search repeated an issue across pages. Retry the poll.');
 				issueIds.add(issue.id);
 				yield issue;
 			}
 
-			const lastIssue = pageIssues.at(-1);
-			limits.pageProgress?.(
-				requestPageToken,
-				lastIssue?.key,
-				lastIssue ? Date.parse(lastIssue.fields.created ?? '') : undefined,
-				lastIssue && requestPageToken === undefined
-					? requestKey(
-							buildPollingJql(
-								predicate,
-								lowerBound,
-								limits.direction,
-								Math.floor(Date.parse(lastIssue.fields.created ?? '') / 60_000) * 60_000,
-								limits.createdBefore,
-							),
-						)
-					: requestKey(),
-			);
-
 			if (isLast) return;
 			nextPageToken = followingPageToken;
 		}
+
+		throw new PollBudgetExhausted('page cap');
 	}
 
 	async *comments(
@@ -655,6 +540,8 @@ export class JiraTransport {
 			if (next >= total) return;
 			startAt = next;
 		}
+
+		throw new PollBudgetExhausted('page cap');
 	}
 }
 
