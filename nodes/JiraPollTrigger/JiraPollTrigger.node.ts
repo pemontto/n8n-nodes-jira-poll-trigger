@@ -358,9 +358,12 @@ export class JiraPollTrigger implements INodeType {
 			const items = result.events.length
 				? [
 						this.helpers.returnJsonArray(
-							result.events.map((event) =>
-								formatEvent(event, simplify, outputFormat),
-							) as IDataObject[],
+							// eventId goes last so the readable fields lead in the editor's output view.
+							result.events.map((event) => {
+								const { eventId, ...rest } = formatEvent(event, simplify, outputFormat);
+
+								return { ...rest, eventId };
+							}) as IDataObject[],
 						),
 					]
 				: null;
