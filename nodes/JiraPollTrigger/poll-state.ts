@@ -4,6 +4,7 @@ export interface Issue {
 	key: string;
 	fields: Record<string, unknown> & { created?: string; updated?: string };
 }
+
 export interface Comment {
 	id: string;
 	created: string;
@@ -13,6 +14,7 @@ export interface Comment {
 	jsdPublic?: boolean;
 	[key: string]: unknown;
 }
+
 export interface PollConfig {
 	site?: string;
 	resource: 'issue' | 'comment';
@@ -22,6 +24,7 @@ export interface PollConfig {
 	excludedAccountIds: string[];
 	publicOnly: boolean;
 }
+
 /**
  * A window the poll budget interrupted. Its events lie in [since, until] and
  * its issues were created by `until`, a bound no edit can move, so the scan is
@@ -59,6 +62,7 @@ export interface PollWindow {
 	 */
 	partial?: { issue: Issue; startAt: number; lastCommentId: string; done: boolean };
 }
+
 export interface PollState {
 	version: 1;
 	fingerprint: string;
@@ -70,6 +74,7 @@ export interface PollState {
 	/** Confirmed missing issues are skipped while their search results may overlap. */
 	droppedIssues?: Array<{ id: string; through: number }>;
 }
+
 export interface PollEvent {
 	eventType: 'issue.created' | 'issue.updated' | 'comment.created' | 'comment.updated';
 	eventId: string;
@@ -77,6 +82,7 @@ export interface PollEvent {
 	issue: Issue;
 	comment?: Comment;
 }
+
 export interface SearchReadOptions {
 	/** Resume at this creation minute; `afterKeys` are skipped by the scanner. */
 	afterCreated?: number;
@@ -106,6 +112,7 @@ export interface SearchReadOptions {
 	/** Return only issues created at or before this epoch millisecond. */
 	createdBefore?: number;
 }
+
 export interface CommentReadOptions {
 	/** First unread comment offset. */
 	resumeAt?: number;
@@ -114,10 +121,12 @@ export interface CommentReadOptions {
 	/** Called after each page with the offset of the first unread comment and the ID before it. */
 	progress?: (nextStartAt: number, lastCommentId: string) => void;
 }
+
 export interface PollSource {
 	issues(updatedSince: number, options?: SearchReadOptions): AsyncIterable<Issue>;
 	comments(issue: Issue, options?: CommentReadOptions): AsyncIterable<Comment>;
 }
+
 export const MAX_DEDUP_KEYS = 40_000;
 
 /** A Jira read failure with its HTTP and retry identity preserved. */
@@ -166,7 +175,9 @@ function compareIssueKeys(left: string, right: string): number {
 	const parts = (key: string) => /^(.*?)-(\d+)$/.exec(key);
 	const a = parts(left);
 	const b = parts(right);
+
 	if (a && b) return a[1].localeCompare(b[1]) || Number(a[2]) - Number(b[2]);
+
 	return left.localeCompare(right);
 }
 
@@ -181,6 +192,7 @@ function compareIssuePosition(
 
 function validateState(state: PollState): void {
 	const { window } = state;
+
 	if (
 		state.version !== 1 ||
 		typeof state.fingerprint !== 'string' ||
@@ -266,6 +278,7 @@ export interface ScanOptions {
 	/** Whether the host has a poll budget, for budget-aware transient read handling. */
 	budgeted?: boolean;
 }
+
 export interface ScanResult {
 	events: PollEvent[];
 	state: PollState | undefined;
@@ -286,13 +299,16 @@ export interface ScanResult {
  */
 export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 	const { config, state, pollStart, manual = false, manualLimit = 1 } = options;
+
 	if (manual && (!Number.isInteger(manualLimit) || manualLimit < 1 || manualLimit > 100))
 		throw new Error('Set test limit to an integer between 1 and 100');
+
 	if (
 		!['issue', 'comment'].includes(config.resource) ||
 		!['created', 'updated', 'createdOrUpdated'].includes(config.event)
 	)
 		throw new Error('Invalid Jira polling resource or event.');
+
 	if (
 		typeof config.fingerprint !== 'string' ||
 		!Array.isArray(config.excludedAccountIds) ||
@@ -300,9 +316,12 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 		typeof config.publicOnly !== 'boolean'
 	)
 		throw new Error('Invalid Jira polling configuration.');
+
 	if (!Number.isFinite(pollStart) || !Number.isFinite(config.overlapMs) || config.overlapMs < 0)
 		throw new Error('Invalid polling time or overlap.');
+
 	if (state) validateState(state);
+
 	if (!manual && (!state || state.fingerprint !== config.fingerprint)) {
 		return {
 			events: [],
@@ -315,6 +334,7 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 			},
 		};
 	}
+
 	if (
 		!manual &&
 		state &&
@@ -325,15 +345,19 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 	let current = state;
 	let advanced = false;
 	let dropped: string | undefined;
+
 	for (;;) {
 		const result = await scanWindow({ ...options, state: current });
 		events.push(...result.events);
+
 		if (manual) return { events, state };
 		current = result.state;
 		advanced ||= result.advanced;
 		dropped ??= result.dropped;
+
 		if (result.stopped !== undefined) {
 			if (!advanced) throw noProgressError(config, current!, result, result.stopped);
+
 			return {
 				events,
 				state: current,
@@ -342,14 +366,16 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 				dropped,
 			};
 		}
-		if (current.checkpoint >= pollStart) return { events, state: current, dropped };
+
+		// Scheduled scans return a state; manual scans returned above.
+		if (current!.checkpoint >= pollStart) return { events, state: current, dropped };
 	}
 }
 
 /** Scans the open window, or opens one through the current poll boundary. */
 async function scanWindow(
 	options: ScanOptions & { state: PollState | undefined },
-): Promise<ScanResult & { state: PollState; advanced: boolean }> {
+): Promise<ScanResult & { advanced: boolean }> {
 	const {
 		config,
 		state,
@@ -359,45 +385,59 @@ async function scanWindow(
 		manualLimit = 1,
 		budgeted = false,
 	} = options;
+
 	// An interrupted window is finished before a new one opens. Both host types
 	// scan one interval; hosts without a budget stop only at the key cap.
 	const since = manual ? 0 : Math.max(state!.activation, state!.checkpoint - config.overlapMs);
 	const until = pollStart;
+
 	const window: PollWindow = manual
 		? { since, until: pollStart }
 		: (state!.window ?? { since, until });
+
 	const lower = window.since;
 	const upper = window.until;
 	const retainFrom = manual ? 0 : Math.max(state!.activation, upper - config.overlapMs);
+
 	const seen = new Map(
 		(manual ? [] : state!.seen)
 			.filter((entry) => entry.time >= lower)
 			.map((entry) => [entry.key, entry.time]),
 	);
+
 	const droppedIssues = new Map(
 		(manual ? [] : (state!.droppedIssues ?? []))
 			.filter((entry) => entry.through >= lower)
 			.map((entry) => [entry.id, entry]),
 	);
+
 	const excluded = new Set(config.excludedAccountIds);
 	const events: PollEvent[] = [];
+
 	const consider = (issue: Issue, comment?: Comment): void => {
 		if (comment && config.publicOnly && comment.jsdPublic !== true) return;
 		const entity = comment ?? issue.fields;
 		const created = Date.parse(String(entity.created ?? ''));
 		const updated = Date.parse(String(entity.updated ?? ''));
+
 		if (!Number.isFinite(created) || !Number.isFinite(updated))
 			throw new Error('Jira returned an invalid created or updated timestamp.');
+
 		for (const kind of ['created', 'updated'] as const) {
 			if (config.event !== 'createdOrUpdated' && config.event !== kind) continue;
 			const time = kind === 'created' ? created : updated;
+
 			if (kind === 'updated' && updated <= created) continue;
+
 			if (time < lower || time > upper) continue;
 			const actor = kind === 'created' ? comment?.author : comment?.updateAuthor;
+
 			if (actor?.accountId && excluded.has(actor.accountId)) continue;
-			const eventType = `${config.resource}.${kind}` as PollEvent['eventType'];
+			const eventType: PollEvent['eventType'] = `${config.resource}.${kind}`;
 			const key = JSON.stringify([config.resource, issue.id, comment?.id ?? issue.id, kind, time]);
+
 			if (seen.has(key)) continue;
+
 			if (!manual && seen.size >= MAX_DEDUP_KEYS)
 				throw new PollBudgetExhausted('deduplication keys reached the 40,000 limit');
 			seen.set(key, time);
@@ -417,16 +457,20 @@ async function scanWindow(
 				issue,
 				...(comment ? { comment } : {}),
 			});
+
 			if (manual && events.length >= manualLimit) return;
 		}
 	};
+
 	let afterCreated = window.afterCreated;
 	let afterKeys = window.afterKeys ? [...window.afterKeys] : undefined;
 	let afterIds = window.afterIds ? [...window.afterIds] : undefined;
+
 	let resumeWithPageToken =
 		(window.resumeWithPageToken === true || window.pageToken !== undefined) &&
 		window.pageTokenLastKey !== undefined &&
 		window.pageTokenRequestKey !== undefined;
+
 	let pageToken = resumeWithPageToken ? window.pageToken : undefined;
 	let pageTokenAfterCreated = resumeWithPageToken ? window.pageTokenAfterCreated : undefined;
 	let pageTokenLastKey = resumeWithPageToken ? window.pageTokenLastKey : undefined;
@@ -441,6 +485,7 @@ async function scanWindow(
 	let current: { issue: Issue; next: number; last: string } | undefined;
 	let stopped: string | undefined;
 	let dropped: string | undefined;
+
 	/** Reads an issue's comments; returns true when the manual limit is reached. */
 	const readComments = async (
 		issue: Issue,
@@ -448,6 +493,7 @@ async function scanWindow(
 	): Promise<boolean> => {
 		activeIssueId = issue.id;
 		current = { issue, next: resume?.startAt ?? 0, last: resume?.lastCommentId ?? '' };
+
 		const read: CommentReadOptions = {
 			resumeAt: resume?.startAt,
 			resumeAfter: resume?.lastCommentId,
@@ -455,24 +501,32 @@ async function scanWindow(
 				if (current) current = { ...current, next, last };
 			},
 		};
+
 		for await (const comment of source.comments(issue, manual ? undefined : read)) {
 			// Comments arrive in creation order: from the first one created after
 			// the window, every later one is newer too, so the read is finite.
 			if (!manual && Date.parse(String(comment.created)) > upper) break;
 			consider(issue, comment);
+
 			if (manual && events.length >= manualLimit) return true;
 		}
+
 		current = undefined;
 		activeIssueId = undefined;
+
 		return false;
 	};
+
 	const advancePosition = (issue: Issue): void => {
 		const created = Date.parse(String(issue.fields.created ?? ''));
+
 		if (!Number.isFinite(created))
 			throw new Error('Jira returned an invalid issue creation timestamp.');
 		const minute = Math.floor(created / 60_000) * 60_000;
+
 		if (afterCreated === minute) {
 			if (!afterKeys?.includes(issue.key)) afterKeys = [...(afterKeys ?? []), issue.key];
+
 			if (!afterIds?.includes(issue.id)) afterIds = [...(afterIds ?? []), issue.id];
 		} else {
 			afterCreated = minute;
@@ -480,18 +534,22 @@ async function scanWindow(
 			afterIds = [issue.id];
 		}
 	};
+
 	const alreadyHandledAtMinute = (issue: Issue): boolean => {
 		if (afterCreated === undefined) return false;
 		const created = Date.parse(String(issue.fields.created ?? ''));
+
 		if (!Number.isFinite(created))
 			throw new Error('Jira returned an invalid issue creation timestamp.');
 		const minute = Math.floor(created / 60_000) * 60_000;
+
 		return (
 			minute < afterCreated ||
 			(minute === afterCreated &&
 				Boolean(afterKeys?.includes(issue.key) || afterIds?.includes(issue.id)))
 		);
 	};
+
 	const dropMissingIssue = (issue: Issue): void => {
 		dropped = issue.id;
 		droppedIssues.set(issue.id, { id: issue.id, through: upper + config.overlapMs });
@@ -500,8 +558,10 @@ async function scanWindow(
 		current = undefined;
 		activeIssueId = undefined;
 	};
+
 	let stopError: JiraReadError | undefined;
 	let budgetExhausted = false;
+
 	try {
 		// Finish the outstanding issue before searching: the search that found it
 		// may not fit in the budget alongside its comments.
@@ -513,11 +573,13 @@ async function scanWindow(
 				// A deleted or hidden issue cannot be finished; drop it rather than
 				// block every other issue behind it.
 				const gone = error instanceof JiraReadError && error.issueMissing;
+
 				// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 				if (!gone) throw error;
 				dropMissingIssue(partial.issue);
 			}
 		}
+
 		for await (const issue of source.issues(
 			lower,
 			manual
@@ -562,10 +624,12 @@ async function scanWindow(
 					},
 		)) {
 			if (!manual && alreadyHandledAtMinute(issue)) continue;
+
 			if (!manual && droppedIssues.has(issue.id)) {
 				advancePosition(issue);
 				continue;
 			}
+
 			if (partial?.issue.id === issue.id) {
 				// Already finished ahead of the search; its keys can retire now.
 				partial = undefined;
@@ -576,16 +640,18 @@ async function scanWindow(
 			} else {
 				try {
 					if (await readComments(issue))
-						return { events, state: state as PollState, advanced: true };
+						return { events, state, advanced: true };
 				} catch (error) {
 					const gone = error instanceof JiraReadError && error.issueMissing;
+
 					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 					if (!gone) throw error;
 					dropMissingIssue(issue);
 				}
 			}
+
 			if (manual && events.length >= manualLimit)
-				return { events, state: state as PollState, advanced: true };
+				return { events, state, advanced: true };
 			advancePosition(issue);
 			activeIssueId = undefined;
 		}
@@ -593,9 +659,11 @@ async function scanWindow(
 		// Budget stops and exhausted transient reads hand over the processed prefix.
 		// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 		if (manual) throw error;
+
 		if (error instanceof PollBudgetExhausted) {
 			budgetExhausted = true;
 			stopped = error.reason;
+
 			if (error.status !== undefined || error.timedOut)
 				stopError = new JiraReadError(error.message, error.status, {
 					details: error.details,
@@ -616,8 +684,10 @@ async function scanWindow(
 			throw error;
 		}
 	}
-	if (manual) return { events, state: state as PollState, advanced: true };
+
+	if (manual) return { events, state, advanced: true };
 	let advanced = true;
+
 	if (stopped !== undefined) {
 		if (current)
 			partial = {
@@ -626,13 +696,17 @@ async function scanWindow(
 				lastCommentId: current.last,
 				done: false,
 			};
+
 		const mark = (value: PollWindow['partial']) =>
 			value ? [value.issue.id, value.startAt, value.lastCommentId, value.done].join('/') : '';
+
 		const positionAdvanced =
 			afterCreated !== window.afterCreated ||
 			JSON.stringify(afterKeys ?? []) !== JSON.stringify(window.afterKeys ?? []) ||
 			JSON.stringify(afterIds ?? []) !== JSON.stringify(window.afterIds ?? []);
+
 		resumeWithPageToken = pageTokenLastKey !== undefined && pageTokenRequestKey !== undefined;
+
 		const pageTokenPositionAdvanced =
 			pageTokenLastKey !== undefined &&
 			(window.pageTokenLastKey === undefined ||
@@ -644,24 +718,29 @@ async function scanWindow(
 						window.pageTokenLastCreated,
 						window.pageTokenLastKey,
 					) > 0));
+
 		advanced =
 			events.length > 0 ||
 			positionAdvanced ||
 			pageTokenPositionAdvanced ||
 			mark(partial) !== mark(window.partial);
 	}
+
 	// During a stopped window, the issue cursor excludes completed issues. Keep
 	// recent overlap keys for the next window and all keys for a partial issue.
 	const keepIssue =
 		stopped !== undefined ? (partial?.issue.id ?? activeIssueId ?? current?.issue.id) : undefined;
+
 	const priorKeys = new Set(
 		(manual ? [] : state!.seen).filter((entry) => entry.time >= lower).map((entry) => entry.key),
 	);
+
 	const retained = [...seen].filter(([key, time]) =>
 		stopped !== undefined
 			? priorKeys.has(key) || time >= retainFrom || issueOf(key) === keepIssue
 			: time >= retainFrom,
 	);
+
 	return {
 		events,
 		stopped,
@@ -704,12 +783,14 @@ async function scanWindow(
 function noProgressError(
 	config: PollConfig,
 	state: PollState,
-	result: ScanResult & { state: PollState },
+	result: ScanResult,
 	reason: string,
 ): Error {
-	const window = result.state.window;
+	// Only scheduled scans call this helper, and they always return a state.
+	const window = result.state!.window;
 	const position = window ? `window [${window.since}, ${window.until}]` : 'no open window';
 	const prefix = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, ${position}`;
+
 	if (result.stopError instanceof JiraReadError && result.stopError.status !== undefined)
 		return new JiraReadError(`${prefix}: ${reason}`, result.stopError.status, {
 			details: result.stopError.details,
@@ -717,6 +798,7 @@ function noProgressError(
 			transient: result.stopError.transient,
 			timedOut: result.stopError.timedOut,
 		});
+
 	if (result.budgetExhausted && result.pageTokenReplayBlocked) {
 		const fallback =
 			result.pageTokenFallbackReason === 'position-mismatch'
@@ -724,14 +806,17 @@ function noProgressError(
 				: result.pageTokenFallbackReason === 'request-mismatch'
 					? 'The saved Jira page request no longer matches its request digest.'
 					: 'Jira rejected the saved page token.';
+
 		return new Error(
 			`${prefix}: ${fallback} The fallback minute query used the poll budget without reaching new work. Increase the poll budget or narrow the JQL.`,
 		);
 	}
+
 	if (result.budgetExhausted && result.savedPageReplayed)
 		return new Error(
 			`${prefix}: the poll budget ended after re-reading the last Jira search page and before reaching the next page. A budget that can read only one search page cannot advance this backlog; increase the poll budget or narrow the JQL.`,
 		);
+
 	if (result.stopError instanceof JiraReadError)
 		return new JiraReadError(`${prefix}: ${reason}`, result.stopError.status, {
 			details: result.stopError.details,
@@ -739,6 +824,7 @@ function noProgressError(
 			transient: result.stopError.transient,
 			timedOut: result.stopError.timedOut,
 		});
+
 	return new Error(`${prefix}: ${reason}. Check Jira availability and the poll interval.`);
 }
 
@@ -759,7 +845,9 @@ function positionedError(
 ): Error {
 	const message =
 		error instanceof Error ? error.message : 'Jira pagination failed without an error message';
+
 	const positioned = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, window [${lower}, ${upper}]: ${message}`;
+
 	if (error instanceof JiraReadError)
 		return new JiraReadError(positioned, error.status, {
 			details: error.details,
@@ -768,6 +856,7 @@ function positionedError(
 			timedOut: error.timedOut,
 			issueMissing: error.issueMissing,
 		});
+
 	return new Error(positioned);
 }
 
@@ -775,12 +864,14 @@ function positionedError(
 function withoutComments(issue: Issue): Issue {
 	const { comment, ...fields } = issue.fields;
 	void comment;
+
 	return { ...issue, fields };
 }
 
 function issueOf(key: string): string | undefined {
 	try {
 		const parts: unknown = JSON.parse(key);
+
 		return Array.isArray(parts) && typeof parts[1] === 'string' ? parts[1] : undefined;
 	} catch {
 		return undefined;
@@ -788,11 +879,13 @@ function issueOf(key: string): string | undefined {
 }
 
 const polls = new Map<string, Promise<unknown>>();
+
 /** Serializes polls within this process. Cross-process exclusion belongs to n8n. */
 export async function serializePoll<T>(key: string, run: () => Promise<T>): Promise<T> {
 	const previous = polls.get(key) ?? Promise.resolve();
 	const current = previous.catch(() => undefined).then(run);
 	polls.set(key, current);
+
 	try {
 		return await current;
 	} finally {

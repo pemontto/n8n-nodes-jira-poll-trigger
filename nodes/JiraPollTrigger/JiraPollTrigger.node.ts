@@ -13,7 +13,7 @@ import { NodeApiError, NodeConnectionTypes, NodeOperationError } from 'n8n-workf
 import { atlassianApiBaseUrl, resolveCloudId } from './atlassian';
 import { cloudBaseUrl, looseSiteUrl } from './config';
 import { properties } from './properties';
-import { formatEvent, type OutputFormat } from './output';
+import { formatEvent } from './output';
 import {
 	scanPoll,
 	serializePoll,
@@ -44,11 +44,13 @@ const oauthRefreshOn = (status: number): IAdditionalCredentialOptions => ({
 });
 
 /** n8n 2.38.0 added getPollBudgetMs to IPollFunctions; older hosts and typings lack it. */
-function pollDeadline(context: object): number | undefined {
-	const host = context as { getPollBudgetMs?: unknown };
-	if (typeof host.getPollBudgetMs !== 'function') return undefined;
-	const budget: unknown = host.getPollBudgetMs();
+function pollDeadline(context: IPollFunctions): number | undefined {
+	if (!('getPollBudgetMs' in context) || typeof context.getPollBudgetMs !== 'function')
+		return undefined;
+	const budget: unknown = context.getPollBudgetMs();
+
 	if (typeof budget !== 'number' || !Number.isFinite(budget)) return undefined;
+
 	return Date.now() + Math.max(0, budget);
 }
 
@@ -96,27 +98,38 @@ export class JiraPollTrigger implements INodeType {
 		// Manual runs have no budget; scheduled ones stop fetching at the deadline.
 		const deadline = manual ? undefined : pollDeadline(this);
 		const suppliedOptions = this.getNodeParameter('options', {}) as IDataObject;
-		const outputOptions = suppliedOptions as IDataObject;
+		const outputOptions = suppliedOptions;
 		const simplify = outputOptions.simplify !== false;
-		const outputFormat = (outputOptions.outputFormat ?? 'rendered') as OutputFormat;
-		if (!['rendered', 'text', 'adf', 'wiki'].includes(outputFormat))
+		const outputFormat = outputOptions.outputFormat ?? 'rendered';
+
+		if (
+			outputFormat !== 'rendered' &&
+			outputFormat !== 'text' &&
+			outputFormat !== 'adf' &&
+			outputFormat !== 'wiki'
+		)
 			throw new NodeOperationError(this.getNode(), 'Select a valid Output Format');
 		const key = `${this.getWorkflow().id}:${this.getNode().id}`;
+
 		return await serializePoll(key, async () => {
 			const pollStart = Date.now();
+
 			const prepared = await (async () => {
 				const oauth = this.getNodeParameter('authentication', 'apiToken') === 'oAuth2';
+
 				const credentialType: CredentialType = oauth
 					? 'jiraSoftwareCloudOAuth2Api'
 					: 'jiraSoftwareCloudApi';
+
 				const credentials = await this.getCredentials(credentialType);
-				const options = outputOptions as IDataObject;
+				const options = outputOptions;
 				const domainOverride = String(options.domain ?? '').trim();
 				const credentialSite = oauth ? looseSiteUrl(credentials.domain) : credentials.domain;
 				// The site origin names the tenant in state and event IDs even when
 				// requests go through the OAuth2 gateway.
 				const baseUrl = cloudBaseUrl(domainOverride || credentialSite);
 				const credentialId = this.getNode().credentials?.[credentialType]?.id ?? undefined;
+
 				const call = async (
 					url: string,
 					request: IDataObject,
@@ -128,10 +141,13 @@ export class JiraPollTrigger implements INodeType {
 						{ ...request, url, json: true, disableFollowRedirect: true },
 						options,
 					);
+
 				const authenticated = async (url: string, request: IDataObject) => {
 					if (!oauth) return await call(url, request);
+
 					const attempt = (status: number, timeout: number) =>
 						call(url, { ...request, timeout }, oauthRefreshOn(status));
+
 					try {
 						return await attempt(403, Number(request.timeout));
 					} catch (error) {
@@ -140,10 +156,12 @@ export class JiraPollTrigger implements INodeType {
 						if (error instanceof PollBudgetExhausted) throw error;
 						const retry = retryDetails(error);
 						const { status } = retry;
+
 						// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 						if (status !== 401 && status !== 404) throw error;
 						const initialTimeout = Number(request.timeout);
 						const remaining = deadline === undefined ? initialTimeout : deadline - Date.now();
+
 						if (remaining <= 0)
 							// scanPoll consumes this sentinel and hands over saved progress.
 							// eslint-disable-next-line @n8n/community-nodes/require-node-api-error, n8n-nodes-base/node-execute-block-wrong-error-thrown
@@ -154,9 +172,11 @@ export class JiraPollTrigger implements INodeType {
 								retry.code,
 								retry.timedOut,
 							);
+
 						return await attempt(status, Math.min(initialTimeout, remaining));
 					}
 				};
+
 				const cloudId = oauth
 					? await resolveCloudId(
 							async () =>
@@ -168,24 +188,30 @@ export class JiraPollTrigger implements INodeType {
 							new URL(baseUrl).hostname,
 						)
 					: undefined;
+
 				const apiBaseUrl = cloudId === undefined ? baseUrl : atlassianApiBaseUrl(cloudId);
 				const resource = this.getNodeParameter('resource') as PollConfig['resource'];
 				const event = this.getNodeParameter('event') as PollConfig['event'];
 				const jql = String(this.getNodeParameter('jql', '')).trim();
 				const activationJql = buildPollingJql(jql, pollStart);
 				const manualLimit = Number(options.testLimit ?? 10);
+
 				if (manual && (!Number.isInteger(manualLimit) || manualLimit < 1 || manualLimit > 100))
 					throw new NodeOperationError(
 						this.getNode(),
 						'Set test limit to an integer between 1 and 100',
 					);
 				const overlapMinutes = Number(options.overlapMinutes ?? 5);
+
 				if (!Number.isFinite(overlapMinutes) || overlapMinutes < 1 || overlapMinutes > 1440)
 					throw new NodeOperationError(this.getNode(), 'Set overlap between 1 and 1440 minutes');
 				const overlapMs = overlapMinutes * 60_000;
+
 				const excludedAccountIds =
 					resource === 'comment' ? commaList(options.excludedAccountIds ?? '') : [];
+
 				const publicOnly = resource === 'comment' && options.visibility === 'public';
+
 				const fields = [
 					...new Set([
 						'summary',
@@ -197,6 +223,7 @@ export class JiraPollTrigger implements INodeType {
 						...commaList(options.additionalFields ?? ''),
 					]),
 				];
+
 				// OAuth2 tokens rotate on refresh, so OAuth2 is fingerprinted by the
 				// stable site identity instead of token material.
 				const fingerprint = JSON.stringify({
@@ -209,6 +236,7 @@ export class JiraPollTrigger implements INodeType {
 					event,
 					jql,
 				});
+
 				const config: PollConfig = {
 					site: new URL(baseUrl).hostname,
 					resource,
@@ -218,6 +246,7 @@ export class JiraPollTrigger implements INodeType {
 					excludedAccountIds,
 					publicOnly,
 				};
+
 				const transport = new JiraTransport(
 					async (request) =>
 						await authenticated(`${apiBaseUrl}${request.path}`, {
@@ -228,13 +257,16 @@ export class JiraPollTrigger implements INodeType {
 						}),
 					{ apiVersion: simplify && outputFormat === 'wiki' ? 2 : 3, deadline },
 				);
+
 				// Comments the search embedded, by issue; only issues with more
 				// comments than the search embeds need requests of their own.
 				const embedded = new Map<string, Comment[]>();
 				const withComments = resource === 'comment';
+
 				const source = {
 					async *issues(lower: number, read?: SearchReadOptions): AsyncIterable<Issue> {
 						let count = 0;
+
 						for await (const issue of transport.searchIssues(
 							jql,
 							manual ? pollStart - 30 * 86_400_000 : lower,
@@ -243,32 +275,41 @@ export class JiraPollTrigger implements INodeType {
 							{ ...(manual ? { maxPages: 2, direction: 'DESC' as const } : read), withComments },
 						)) {
 							const comments = withComments ? embeddedComments(issue) : undefined;
+
 							if (comments) embedded.set(issue.id, comments);
+
 							if (withComments) {
 								const { comment, ...rest } = issue.fields;
 								const { comment: renderedComment, ...renderedRest } = issue.renderedFields ?? {};
 								void comment;
 								void renderedComment;
-								yield { ...issue, fields: rest, renderedFields: renderedRest } as unknown as Issue;
+								yield { ...issue, fields: rest, renderedFields: renderedRest };
 							} else yield issue;
+
 							if (manual && ++count >= 100) return;
 						}
 					},
 					async *comments(issue: Issue, read?: CommentReadOptions): AsyncIterable<Comment> {
 						const known = embedded.get(issue.id);
+
 						if (known) {
 							yield* known;
+
 							return;
 						}
+
 						for await (const comment of transport.comments(issue.id, {
 							...(manual ? { maxPages: 2 } : {}),
 							...read,
 						}))
-							yield comment as unknown as Comment;
+							yield comment;
 					},
 				};
+
 				const data = manual ? undefined : this.getWorkflowStaticData('node');
-				const before = data?.jiraPollState as unknown as PollState | undefined;
+				// SAFETY: jiraPollState is written below from scanPoll's PollState result and validated by scanPoll before scanning.
+				const before = data?.jiraPollState as PollState | undefined;
+
 				if (!manual && before?.fingerprint !== fingerprint) {
 					try {
 						await authenticated(
@@ -284,13 +325,20 @@ export class JiraPollTrigger implements INodeType {
 						const raw = error as IDataObject;
 						let source: IDataObject | undefined = raw;
 						let body: IDataObject | undefined;
+
 						for (let depth = 0; depth < 5 && source; depth++) {
+							// SAFETY: The response is only read for its optional data property; no response field type is assumed.
 							const response = source.response as IDataObject | undefined;
+
+							// SAFETY: Jira HTTP response data is read only for optional error properties, with value checks below.
 							body ??= response?.data as IDataObject | undefined;
+							// SAFETY: Each cause is only traversed for optional response, cause, and message properties.
 							source = source.cause as IDataObject | undefined;
 						}
+
 						const messages = body?.errorMessages;
 						const errors = body?.errors;
+
 						const jiraMessage = String(
 							(error instanceof PollBudgetExhausted && error.details ? error.details : undefined) ??
 								body?.message ??
@@ -301,23 +349,28 @@ export class JiraPollTrigger implements INodeType {
 								raw.message ??
 								'Jira activation validation failed',
 						);
+
 						throw new NodeApiError(this.getNode(), error as JsonObject, {
 							message: jiraMessage,
 							httpCode: status ? String(status) : undefined,
 						});
 					}
 				}
+
 				return { config, before, source, manualLimit, data };
 			})().catch((error) => {
 				// Activation API errors retain Jira's message and HTTP status.
 				if (error instanceof NodeApiError) throw error;
+
 				if (error instanceof NodeOperationError) throw error;
 				throw new NodeOperationError(
 					this.getNode(),
 					error instanceof Error ? error.message : 'Jira polling failed',
 				);
 			});
+
 			const { config, before, source, manualLimit, data } = prepared;
+
 			try {
 				const result = await scanPoll({
 					config,
@@ -328,16 +381,19 @@ export class JiraPollTrigger implements INodeType {
 					manualLimit,
 					budgeted: deadline !== undefined,
 				});
+
 				// Format before committing: a formatting failure must not advance the checkpoint.
+				// SAFETY: formatEvent returns Jira JSON fields and poll metadata for n8n's JSON output helper.
 				const items = result.events.length
 					? [
 							this.helpers.returnJsonArray(
 								result.events.map((event) =>
 									formatEvent(event, simplify, outputFormat),
-								) as unknown as IDataObject[],
+								) as IDataObject[],
 							),
 						]
 					: null;
+
 				if (!manual && data && result.state) {
 					// The runtime owns durable commit. Do not call its internal cursor methods.
 					if (data.jiraPollState !== before)
@@ -345,12 +401,15 @@ export class JiraPollTrigger implements INodeType {
 							this.getNode(),
 							'Polling state changed during this poll; retry without advancing the checkpoint',
 						);
-					data.jiraPollState = result.state as unknown as IDataObject;
+					// SAFETY: scanPoll constructs PollState from JSON-compatible checkpoint, cursor, and Jira payload fields.
+					data.jiraPollState = result.state as PollState & IDataObject;
+
 					if (result.dropped !== undefined)
 						this.logger.warn(
 							`Jira Poll Trigger dropped issue ${result.dropped}: Jira no longer serves its comments`,
 							{ node: this.getNode().name },
 						);
+
 					// A stop on a failed request is quiet on the output; say so in the log.
 					if (result.stopped !== undefined && result.stopped !== 'deadline')
 						this.logger.warn(
@@ -358,11 +417,13 @@ export class JiraPollTrigger implements INodeType {
 							{ node: this.getNode().name },
 						);
 				}
+
 				return items;
 			} catch (error) {
 				// Preserve existing n8n API and operation error metadata.
 				// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 				if (error instanceof NodeApiError || error instanceof NodeOperationError) throw error;
+
 				if (error instanceof JiraReadError)
 					throw new NodeApiError(
 						this.getNode(),

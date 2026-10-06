@@ -2,11 +2,13 @@
 /* eslint-disable @n8n/community-nodes/require-node-api-error */
 export function cloudBaseUrl(value: unknown): string {
 	let url: URL;
+
 	try {
 		url = new URL(String(value));
 	} catch {
 		throw new Error('Set a valid Jira Cloud domain in the node or credential');
 	}
+
 	if (
 		url.protocol !== 'https:' ||
 		!url.hostname.endsWith('.atlassian.net') ||
@@ -19,6 +21,7 @@ export function cloudBaseUrl(value: unknown): string {
 	) {
 		throw new Error('Use an HTTPS Jira Cloud tenant domain such as https://example.atlassian.net');
 	}
+
 	return url.origin;
 }
 
@@ -27,10 +30,12 @@ export function looseSiteUrl(value: unknown): string {
 	const trimmed = String(value ?? '').trim();
 	const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 	let url: URL;
+
 	try {
 		url = new URL(withScheme);
 	} catch {
 		throw new Error('Set a valid Jira Cloud domain in the node or credential');
 	}
+
 	return `https://${url.hostname}`;
 }

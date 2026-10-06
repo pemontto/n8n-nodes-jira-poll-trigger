@@ -5,6 +5,7 @@ export interface AccessibleResource {
 	id: string;
 	url: string;
 }
+
 export type ReadAccessibleResources = () => Promise<unknown>;
 
 // credentialId to accessible-resources, for the life of the process.
@@ -19,9 +20,11 @@ function resources(value: unknown): AccessibleResource[] {
 		(item): item is AccessibleResource =>
 			item !== null &&
 			typeof item === 'object' &&
-			typeof (item as AccessibleResource).id === 'string' &&
-			(item as AccessibleResource).id !== '' &&
-			typeof (item as AccessibleResource).url === 'string',
+			'id' in item &&
+			typeof item.id === 'string' &&
+			item.id !== '' &&
+			'url' in item &&
+			typeof item.url === 'string',
 	);
 }
 
@@ -35,6 +38,7 @@ export async function resolveCloudId(
 	hostname: string,
 ): Promise<string> {
 	const wanted = hostname.toLowerCase();
+
 	const match = (sites: AccessibleResource[]) =>
 		sites.find((site) => {
 			try {
@@ -43,12 +47,17 @@ export async function resolveCloudId(
 				return false;
 			}
 		});
+
 	let sites = credentialId ? accessibleResources.get(credentialId) : undefined;
+
 	if (!sites || !match(sites)) {
 		sites = resources(await read());
+
 		if (credentialId) accessibleResources.set(credentialId, sites);
 	}
+
 	const site = match(sites);
+
 	if (!site) {
 		const urls = sites.map((item) => item.url).filter(Boolean);
 		throw new Error(
@@ -57,5 +66,6 @@ export async function resolveCloudId(
 			}${urls.length > 5 ? `, and ${urls.length - 5} more` : ''}.`,
 		);
 	}
+
 	return site.id;
 }
