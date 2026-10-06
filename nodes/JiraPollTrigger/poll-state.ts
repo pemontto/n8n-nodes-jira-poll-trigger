@@ -92,7 +92,6 @@ export class JiraReadError extends Error {
 		options: {
 			details?: string;
 			code?: unknown;
-			transient?: boolean;
 			timedOut?: boolean;
 			issueMissing?: boolean;
 		} = {},
@@ -100,23 +99,26 @@ export class JiraReadError extends Error {
 		super(message);
 		this.details = options.details;
 		this.code = options.code;
-		this.transient = options.transient ?? false;
 		this.timedOut = options.timedOut ?? false;
 		this.issueMissing = options.issueMissing ?? false;
 	}
 	public readonly details?: string;
 	public readonly code?: unknown;
-	public readonly transient: boolean;
 	public readonly timedOut: boolean;
 	public readonly issueMissing: boolean;
 }
 
 /** Stops a scan with its progress kept: the budget cannot fit the next step. */
 export class PollBudgetExhausted extends Error {
-	constructor(public readonly reason: string) {
+	constructor(
+		public readonly reason: string,
+		public readonly failure?: JiraReadError,
+	) {
 		super(`Jira poll budget exhausted: ${reason}.`);
 	}
 }
+
+export class PaginationProgressError extends Error {}
 
 function validateState(state: PollState): void {
 	const { window } = state;
@@ -192,27 +194,7 @@ export interface ScanResult {
  * early returns what it processed and saves where to continue.
  */
 export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
-	const { config, state, pollStart, manual = false, manualLimit = 1 } = options;
-
-	if (manual && (!Number.isInteger(manualLimit) || manualLimit < 1 || manualLimit > 100))
-		throw new Error('Set test limit to an integer between 1 and 100');
-
-	if (
-		!['issue', 'comment'].includes(config.resource) ||
-		!['created', 'updated', 'createdOrUpdated'].includes(config.event)
-	)
-		throw new Error('Invalid Jira polling resource or event.');
-
-	if (
-		typeof config.fingerprint !== 'string' ||
-		!Array.isArray(config.excludedAccountIds) ||
-		config.excludedAccountIds.some((id) => typeof id !== 'string') ||
-		typeof config.publicOnly !== 'boolean'
-	)
-		throw new Error('Invalid Jira polling configuration.');
-
-	if (!Number.isFinite(pollStart) || !Number.isFinite(config.overlapMs) || config.overlapMs < 0)
-		throw new Error('Invalid polling time or overlap.');
+	const { config, state, pollStart, manual = false } = options;
 
 	if (state?.version === 2) validateState(state);
 
@@ -268,7 +250,7 @@ export async function scanPoll(options: ScanOptions): Promise<ScanResult> {
 /** Scans the open window, or opens one through the current poll boundary. */
 async function scanWindow(
 	options: ScanOptions & { state: PollState | undefined },
-): Promise<ScanResult & { advanced: boolean }> {
+): Promise<ScanResult & { advanced: boolean; failure?: JiraReadError }> {
 	const { config, state, pollStart, source, manual = false, manualLimit = 1, warn } = options;
 
 	// An interrupted window is finished before a new one opens. Both host types
@@ -366,6 +348,7 @@ async function scanWindow(
 	let activeIssueId: string | undefined;
 	let current: { issue: Issue; next: number; last: string } | undefined;
 	let stopped: string | undefined;
+	let failure: JiraReadError | undefined;
 	let dropped: string | undefined;
 
 	/** Reads an issue's comments; returns true when the manual limit is reached. */
@@ -493,16 +476,16 @@ async function scanWindow(
 			activeIssueId = undefined;
 		}
 	} catch (error) {
-		// Only our deadline or page cap can hand over a completed prefix.
+		// A budget stop preserves progress and the identity of any failed read.
 		if (error instanceof PollBudgetExhausted) {
-			if (manual) return { events, state, advanced: true };
 			stopped = error.reason;
+			failure = error.failure;
 		} else if (manual) {
 			// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
 			throw error;
 		} else if (error instanceof JiraReadError && state?.window !== undefined) {
 			throw positionedError(error, config, state, lower, upper);
-		} else if (isPaginationProgressError(error)) {
+		} else if (error instanceof PaginationProgressError) {
 			throw positionedError(error, config, state!, lower, upper);
 		} else {
 			// Let the node entry point preserve JiraReadError status and details.
@@ -551,6 +534,7 @@ async function scanWindow(
 	return {
 		events,
 		stopped,
+		failure,
 		dropped,
 		advanced,
 		state: {
@@ -578,7 +562,7 @@ async function scanWindow(
 function noProgressError(
 	config: PollConfig,
 	state: PollState,
-	result: ScanResult,
+	result: ScanResult & { failure?: JiraReadError },
 	reason: string,
 ): Error {
 	// Only scheduled scans call this helper, and they always return a state.
@@ -590,15 +574,11 @@ function noProgressError(
 
 	const prefix = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, ${position}`;
 
-	return new Error(`${prefix}: ${reason}. Increase the poll budget or narrow the JQL.`);
-}
+	const message = `${prefix}: ${reason}. Increase the poll budget or narrow the JQL.`;
 
-function isPaginationProgressError(error: unknown): boolean {
-	return (
-		error instanceof Error &&
-		(/pagination (?:did not advance|repeated)/i.test(error.message) ||
-			/repeated (?:an issue|a comment) across pages/i.test(error.message))
-	);
+	return result.failure
+		? new JiraReadError(message, result.failure.status, result.failure)
+		: new Error(message);
 }
 
 function positionedError(
@@ -611,16 +591,9 @@ function positionedError(
 	const message =
 		error instanceof Error ? error.message : 'Jira pagination failed without an error message';
 
-	const positioned = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} made no progress at checkpoint ${state.checkpoint}, window [${lower}, ${upper}]: ${message}`;
+	const positioned = `Jira ${config.resource} poll for ${config.site ?? 'the configured site'} failed at checkpoint ${state.checkpoint}, window [${lower}, ${upper}]: ${message}`;
 
-	if (error instanceof JiraReadError)
-		return new JiraReadError(positioned, error.status, {
-			details: error.details,
-			code: error.code,
-			transient: error.transient,
-			timedOut: error.timedOut,
-			issueMissing: error.issueMissing,
-		});
+	if (error instanceof JiraReadError) return new JiraReadError(positioned, error.status, error);
 
 	return new Error(positioned);
 }

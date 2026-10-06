@@ -2,6 +2,7 @@ import { sleep } from 'n8n-workflow';
 import {
 	JiraReadError,
 	PollBudgetExhausted,
+	PaginationProgressError,
 	type Issue,
 	type Comment,
 	type CommentReadOptions,
@@ -171,10 +172,9 @@ export function retryDetails(error: unknown): {
 	timedOut ||= timedOutCode;
 
 	const transient =
-		[408, 429, 500, 502, 503, 504].includes(status ?? 0) ||
-		['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ECONNABORTED', 'ESOCKETTIMEDOUT'].includes(
-			String(code),
-		);
+		status !== undefined
+			? status === 408 || status === 429 || status >= 500
+			: timedOut || ['ECONNRESET', 'EAI_AGAIN'].includes(String(code));
 
 	return { status, headers: headers ?? {}, code, details, transient, timedOut };
 }
@@ -184,7 +184,12 @@ function stringValue(value: unknown): string | undefined {
 }
 
 function jiraMessageText(body: JsonRecord): string | undefined {
-	const messages = [body.errorMessages, body.warningMessages]
+	const messages = [
+		body.errorMessages,
+		body.warningMessages,
+		record(body.errors) ? Object.values(body.errors) : [],
+		[body.message],
+	]
 		.flatMap((value) => (Array.isArray(value) ? value : []))
 		.flatMap((value) => {
 			const message =
@@ -233,9 +238,6 @@ export class JiraTransport {
 			const requestStarted = this.now();
 			const timeout = requestTimeout(this.deadline, requestStarted);
 
-			const deadlineTimeout =
-				this.deadline !== undefined && timeout === this.deadline - requestStarted;
-
 			let result: unknown;
 
 			try {
@@ -256,7 +258,6 @@ export class JiraTransport {
 					new JiraReadError(message, known ? status : undefined, {
 						details,
 						code,
-						transient,
 						timedOut,
 					});
 
@@ -278,19 +279,11 @@ export class JiraTransport {
 					if (Number.isFinite(requested)) delay = Math.max(delay, requested);
 				}
 
-				// A timeout from our capped deadline can stop. HTTP failures retain their identity.
-				if (
-					timedOut &&
-					deadlineTimeout &&
-					status === undefined &&
-					this.deadline !== undefined &&
-					this.now() >= this.deadline
-				)
-					// scanPoll handles only this sentinel; HTTP failures remain JiraReadError.
+				// A failed read stays attached so a scan with no progress throws it.
+				if (this.deadline !== undefined && this.now() + delay >= this.deadline)
+					// scanPoll decides whether progress permits a handover; the node wraps failures.
 					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
-					throw new PollBudgetExhausted('deadline');
-
-				if (this.deadline !== undefined && this.now() + delay >= this.deadline) throw failure();
+					throw new PollBudgetExhausted(message, failure());
 
 				if (attempt >= this.maxRetries) throw failure();
 
@@ -298,7 +291,9 @@ export class JiraTransport {
 				if (delay > this.maxRetryDelayMs) throw failure();
 				await this.sleep(delay);
 
-				if (this.deadline !== undefined && this.now() >= this.deadline) throw failure();
+				if (this.deadline !== undefined && this.now() >= this.deadline)
+					// eslint-disable-next-line @n8n/community-nodes/require-node-api-error
+					throw new PollBudgetExhausted(message, failure());
 				continue;
 			}
 
@@ -306,6 +301,14 @@ export class JiraTransport {
 
 			return result;
 		}
+	}
+
+	async validateActivation(predicate: string, lowerBound: number): Promise<void> {
+		await this.request({
+			method: 'POST',
+			path: `/rest/api/${this.apiVersion}/search/jql`,
+			body: { jql: buildPollingJql(predicate, lowerBound), fields: ['created'], maxResults: 1 },
+		});
 	}
 
 	private async issueWasDeleted(issueId: string): Promise<boolean> {
@@ -428,14 +431,13 @@ export class JiraTransport {
 					tokens.has(result.nextPageToken) ||
 					pageIssues.length === 0
 				)
-					throw new Error('Jira search pagination did not advance.');
+					throw new PaginationProgressError('Jira search pagination did not advance.');
 				followingPageToken = result.nextPageToken;
 				tokens.add(followingPageToken);
 			}
 
 			for (const issue of pageIssues) {
-				if (issueIds.has(issue.id))
-					throw new Error('Jira search repeated an issue across pages. Retry the poll.');
+				if (issueIds.has(issue.id)) continue;
 				issueIds.add(issue.id);
 				yield issue;
 			}
@@ -486,7 +488,6 @@ export class JiraTransport {
 					throw new JiraReadError(error.message, error.status, {
 						details: error.details,
 						code: error.code,
-						transient: error.transient,
 						timedOut: error.timedOut,
 						issueMissing: true,
 					});
@@ -526,11 +527,13 @@ export class JiraTransport {
 			const next = startAt + comments.length;
 
 			if (next < total && next <= startAt)
-				throw new Error('Jira comment pagination did not advance.');
+				throw new PaginationProgressError('Jira comment pagination did not advance.');
 
 			for (const comment of comments) {
 				if (commentIds.has(comment.id))
-					throw new Error('Jira comment pagination repeated a comment. Retry the poll.');
+					throw new PaginationProgressError(
+						'Jira comment pagination repeated a comment. Retry the poll.',
+					);
 				commentIds.add(comment.id);
 				yield comment;
 			}

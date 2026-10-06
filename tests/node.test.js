@@ -21,7 +21,8 @@ function fixture({
 } = {}) {
 	const state = {},
 		requests = [],
-		options = [];
+		options = [],
+		warnings = [];
 	const identity = ++fixtureSequence;
 	params = {
 		resource: 'issue',
@@ -53,7 +54,7 @@ function fixture({
 			assert.equal(name, credentialType);
 			return credentials;
 		},
-		logger: { warn: () => {} },
+		logger: { warn: (message) => warnings.push(message) },
 		getNodeParameter: (name, fallback) => params[name] ?? fallback,
 		getWorkflowStaticData: (scope) => {
 			assert.equal(scope, 'node');
@@ -74,7 +75,7 @@ function fixture({
 			},
 		},
 	};
-	return { ctx, state, requests, options, params, credentials };
+	return { ctx, state, requests, options, warnings, params, credentials };
 }
 async function at(time, ctx) {
 	const original = Date.now;
@@ -121,7 +122,15 @@ test('activation validates JQL, then subsequent event emits once and empty poll 
 	assert.equal(f.requests[0].url, 'https://example.atlassian.net/rest/api/3/search/jql');
 	assert.equal(f.requests[0].disableFollowRedirect, true);
 });
-test('a discarded activation snapshot retains its baseline and emits gap events', async () => {
+test('invalid resource and event values fail in the node before activation', async () => {
+	for (const params of [{ resource: 'other' }, { event: 'deleted' }]) {
+		const f = fixture({ params });
+		await assert.rejects(at(0, f.ctx), /Invalid Jira polling resource or event/);
+		assert.equal(f.requests.length, 0);
+		assert.deepEqual(f.state, {});
+	}
+});
+test('a missing activation snapshot reuses its pending baseline and emits gap events', async () => {
 	const clock = { now: 0 };
 	const f = fixture({ read: jiraServer({ issues: [{ id: '1', updated: 1 }], clock }) });
 	assert.equal(await at(0, f.ctx), null);
@@ -130,6 +139,66 @@ test('a discarded activation snapshot retains its baseline and emits gap events'
 	assert.deepEqual(emittedIds(await at(10, f.ctx)), ['1']);
 	assert.equal(f.state.jiraPollState.activation, epoch);
 	assert.equal(await at(20, f.ctx), null);
+});
+test('a stale v1 snapshot reuses the pending activation baseline and emits at the first scheduled poll', async () => {
+	const clock = { now: 0 };
+	const f = fixture({ read: jiraServer({ issues: [{ id: '1', updated: 1 }], clock }) });
+	const stale = { version: 1, checkpoint: epoch };
+	f.state.jiraPollState = structuredClone(stale);
+	assert.equal(await at(0, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, epoch);
+	f.state.jiraPollState = structuredClone(stale);
+	assert.deepEqual(emittedIds(await at(10, f.ctx)), ['1']);
+	assert.equal(f.state.jiraPollState.activation, epoch);
+});
+test('a saved snapshot with the wrong fingerprint falls back to the pending baseline', async () => {
+	const clock = { now: 0 };
+	const f = fixture({ read: jiraServer({ issues: [{ id: '1', updated: 1 }], clock }) });
+	const stale = {
+		version: 2,
+		fingerprint: 'wrong',
+		activation: epoch,
+		checkpoint: epoch,
+		seen: [],
+	};
+	f.state.jiraPollState = structuredClone(stale);
+	assert.equal(await at(0, f.ctx), null);
+	f.state.jiraPollState = structuredClone(stale);
+	assert.deepEqual(emittedIds(await at(10, f.ctx)), ['1']);
+	assert.equal(f.state.jiraPollState.activation, epoch);
+});
+test('a pending activation baseline expires after one hour', async () => {
+	const clock = { now: 0 };
+	const f = fixture({ read: jiraServer({ issues: [], clock }) });
+	assert.equal(await at(0, f.ctx), null);
+	delete f.state.jiraPollState;
+	const expiredAt = 60 * minute + 1;
+	assert.equal(await at(expiredAt, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, epoch + expiredAt);
+});
+test('switching A to B and back to A starts a fresh activation baseline', async () => {
+	const f = fixture();
+	assert.equal(await at(0, f.ctx), null);
+	delete f.state.jiraPollState;
+	f.params.jql = 'project = OTHER';
+	assert.equal(await at(10, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, epoch + 10);
+	delete f.state.jiraPollState;
+	f.params.jql = '';
+	assert.equal(await at(20, f.ctx), null);
+	assert.equal(f.state.jiraPollState.activation, epoch + 20);
+});
+test('an emitting poll leaves its pending baseline unchanged', async () => {
+	const clock = { now: 0 };
+	const f = fixture({ read: jiraServer({ issues: [{ id: '1', updated: 1 }], clock }) });
+	assert.equal(await at(0, f.ctx), null);
+	delete f.state.jiraPollState;
+	assert.deepEqual(emittedIds(await at(10, f.ctx)), ['1']);
+	delete f.state.jiraPollState;
+	// The intentionally missing durable snapshot makes this poll reuse the
+	// original pending baseline. An emitting poll must not replace that baseline
+	// with its event-bearing state.
+	assert.deepEqual(emittedIds(await at(20, f.ctx)), ['1']);
 });
 test('invalid JQL fails activation with Jira message and HTTP status', async () => {
 	const f = fixture({
@@ -792,6 +861,44 @@ async function drain(f, budget, expect, { from = 60 * minute, pick = emittedIds 
 	return { delivered, polls };
 }
 
+test('a repeated issue on a later fake-server page is skipped while new issues and the token continue', async () => {
+	const clock = { now: 0 };
+	const server = jiraServer({
+		issues: [1, 2, 3, 4, 5].map((n) => ({ id: String(n), updated: n })),
+		pageSize: 2,
+		clock,
+	});
+	let firstIssue;
+	let injected = false;
+	let unchangedToken;
+	const f = fixture({
+		read: async (request) => {
+			const response = await server(request);
+			if (request.body?.maxResults === 1) return response;
+			if (!request.body.nextPageToken) {
+				firstIssue = response.issues[0];
+				return response;
+			}
+			if (!injected) {
+				injected = true;
+				unchangedToken = response.nextPageToken;
+				return { ...response, issues: [firstIssue, ...response.issues] };
+			}
+			return response;
+		},
+	});
+	await onClock(clock, f.ctx);
+	clock.now = 10;
+	const ids = emittedIds(await onClock(clock, f.ctx));
+	assert.deepEqual(ids, ['1', '2', '3', '4', '5']);
+	assert.equal(new Set(ids).size, ids.length);
+	assert.equal(f.requests.length, 3);
+	assert.ok(unchangedToken);
+	assert.equal(f.requests[2].body.nextPageToken, unchangedToken);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch + 10);
+	assert.equal(f.state.jiraPollState.window, undefined);
+});
+
 test('without a host budget, slow pagination completes and checkpoints as before', async () => {
 	const issues = [1, 2, 3, 4].map((n) => ({ id: String(n), updated: n }));
 	const f = await activated({ issues, costMs: 20_000 });
@@ -996,7 +1103,40 @@ test('a partial first comment scan keeps its checkpoint and finishes the issue n
 	assert.equal(await onClock(f.clock, f.ctx), null);
 	assert.equal(f.state.jiraPollState.window, undefined);
 });
-test('a rate limit on the first request whose wait cannot fit fails visibly without advancing', async () => {
+test('a rate limit after progress emits, saves the cursor and logs the HTTP status', async () => {
+	const clock = { now: 0 };
+	let calls = 0;
+	const server = jiraServer({
+		issues: [
+			{ id: '1', updated: 1 },
+			{ id: '2', updated: 2 },
+		],
+		pageSize: 1,
+		clock,
+	});
+	const f = fixture({
+		read: async (request) => {
+			calls++;
+			if (request.body?.nextPageToken)
+				throw { response: { status: 429, headers: { 'retry-after': '30' } } };
+			return server(request);
+		},
+	});
+	f.ctx.getPollBudgetMs = () => 20_000;
+	await at(0, f.ctx);
+	const before = f.state.jiraPollState;
+	const snapshot = structuredClone(before);
+	const result = await at(10, f.ctx);
+	assert.deepEqual(emittedIds(result), ['1']);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch);
+	assert.equal(f.state.jiraPollState.window.until, epoch + 10);
+	assert.deepEqual(f.state.jiraPollState.window.afterIds, ['1']);
+	assert.equal(calls, 3);
+	assert.notEqual(f.state.jiraPollState, before);
+	assert.deepEqual(before, snapshot);
+	assert.ok(f.warnings.some((message) => /429/.test(message)));
+});
+test('a rate limit on the first request with no progress throws its HTTP status', async () => {
 	const f = fixture({
 		read: async (request) => {
 			if (request.body?.maxResults === 1) return { issues: [], isLast: true };
@@ -1008,23 +1148,25 @@ test('a rate limit on the first request whose wait cannot fit fails visibly with
 	f.ctx.getPollBudgetMs = () => 20_000;
 	await at(0, f.ctx);
 	const before = structuredClone(f.state.jiraPollState);
-	const started = Date.now();
-	await assert.rejects(at(10, f.ctx), /HTTP 429/i);
-	assert.ok(Date.now() - started < 5_000, 'must not wait for Retry-After');
+	await assert.rejects(at(10, f.ctx), (error) => {
+		assert.equal(error.httpCode, '429');
+		assert.match(error.message, /HTTP 429/i);
+		return true;
+	});
 	assert.equal(f.requests.length, 1);
 	assert.deepEqual(f.state.jiraPollState, before);
 });
-test('a non-progressing search error names the site, resource and checkpoint window', async () => {
+test('a pagination failure names the site, resource and checkpoint window without claiming no progress', async () => {
 	const f = fixture({
 		read: async () => ({ issues: [], isLast: false, nextPageToken: 'next' }),
 	});
 	await at(0, f.ctx);
-	await assert.rejects(
-		at(10, f.ctx),
-		new RegExp(
-			`Jira issue poll for example\\.atlassian\\.net made no progress at checkpoint ${epoch}, window \\[${epoch}, ${epoch + 10}\\]`,
-		),
-	);
+	await assert.rejects(at(10, f.ctx), (error) => {
+		assert.match(error.message, /failed at checkpoint/);
+		assert.match(error.message, new RegExp(`window \\[${epoch}, ${epoch + 10}\\]`));
+		assert.doesNotMatch(error.message, /made no progress/);
+		return true;
+	});
 });
 test('an authentication failure after the deadline stays an error', async () => {
 	const f = fixture({
@@ -1166,7 +1308,7 @@ test('recent-key overflow evicts the oldest keys and warns while completing the 
 	assert.equal(keys.at(-1)[1], '20001');
 	assert.ok(warnings.some((message) => /evict|oldest|40,000/.test(message)));
 });
-for (const status of [401, 403, 404, 408, 429, 500, 502, 503, 504])
+for (const status of [401, 403, 404])
 	test(`HTTP ${status} after progress fails without committing the prefix`, async () => {
 		const clock = { now: 0 };
 		const server = jiraServer({
@@ -1189,6 +1331,34 @@ for (const status of [401, 403, 404, 408, 429, 500, 502, 503, 504])
 			return true;
 		});
 		assert.deepEqual(f.state.jiraPollState, before);
+	});
+for (const status of [408, 429, 500, 501, 502, 503, 504])
+	test(`HTTP ${status} after progress hands off the saved fake-server prefix`, async () => {
+		const clock = { now: 0 };
+		const server = jiraServer({
+			issues: [1, 2, 3].map((n) => ({ id: String(n), updated: n })),
+			pageSize: 1,
+			clock,
+		});
+		const f = fixture({
+			read: async (request) => {
+				if (request.body.nextPageToken)
+					throw { response: { status, headers: { 'retry-after': '30' } } };
+				return server(request);
+			},
+		});
+		f.ctx.getPollBudgetMs = () => 20_000;
+		await at(0, f.ctx);
+		const before = f.state.jiraPollState;
+		const snapshot = structuredClone(before);
+		const result = await at(10, f.ctx);
+		assert.deepEqual(emittedIds(result), ['1']);
+		assert.notEqual(f.state.jiraPollState, before);
+		assert.deepEqual(before, snapshot, 'the previous saved object is untouched');
+		assert.equal(f.state.jiraPollState.checkpoint, epoch);
+		assert.equal(f.state.jiraPollState.window.until, epoch + 10);
+		assert.deepEqual(f.state.jiraPollState.window.afterIds, ['1']);
+		assert.ok(f.warnings.some((message) => message.includes(String(status))));
 	});
 test('a resumed search error preserves Jira status and names its saved window', async () => {
 	const f = await activated({
@@ -1783,10 +1953,11 @@ test('manual comment preview continues to later parents after its per-parent pag
 	assert.equal(f.requests.filter((r) => r.url.includes('/issue/1/comment')).length, 2);
 });
 
-test('a timeout before our deadline after progress remains a visible failure', async () => {
+test('a timeout retry that cannot fit the deadline hands off progress with timeout details', async () => {
 	const clock = { now: 0 };
 	const server = jiraServer({
 		issues: [1, 2, 3].map((n) => ({ id: String(n), updated: n })),
+		pageSize: 1,
 		clock,
 	});
 	const f = fixture({
@@ -1803,13 +1974,10 @@ test('a timeout before our deadline after progress remains a visible failure', a
 	});
 	f.ctx.getPollBudgetMs = () => 50_000;
 	await onClock(clock, f.ctx);
-	const before = structuredClone(f.state.jiraPollState);
 	clock.now = 10;
-	await assert.rejects(onClock(clock, f.ctx), (error) => {
-		assert(error instanceof NodeApiError);
-		assert.equal(error.httpCode, 'ECONNABORTED');
-		assert.match(error.description, /Timed out/);
-		return true;
-	});
-	assert.deepEqual(f.state.jiraPollState, before);
+	const result = await onClock(clock, f.ctx);
+	assert.deepEqual(emittedIds(result), ['1']);
+	assert.equal(f.state.jiraPollState.checkpoint, epoch);
+	assert.deepEqual(f.state.jiraPollState.window.afterIds, ['1']);
+	assert.ok(f.warnings.some((message) => /timed out/i.test(message)));
 });

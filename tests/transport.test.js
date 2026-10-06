@@ -398,6 +398,8 @@ test('network retries are bounded and permanent errors do not retry', async () =
 	for (const [error, expected] of [
 		[{ code: 'ECONNRESET' }, 4],
 		[{ statusCode: 401 }, 1],
+		[{ statusCode: 403 }, 1],
+		[{ statusCode: 404 }, 1],
 		[{ statusCode: 400 }, 1],
 	]) {
 		let calls = 0;
@@ -487,17 +489,28 @@ test('search warnings cannot silently accept potentially truncated results', asy
 	);
 });
 
-test('repeated entities fail even when pagination markers keep advancing', async () => {
+test('repeated issues across pages are skipped while repeated page tokens remain errors', async () => {
 	let calls = 0;
+	const items = await collect(
+		new JiraTransport(async () => ({
+			issues: [issue('1')],
+			isLast: calls === 1,
+			...(calls++ === 0 ? { nextPageToken: 'next' } : {}),
+		})).searchIssues('', 0, []),
+	);
+	assert.deepEqual(items, [issue('1')]);
+	assert.equal(calls, 2);
+	calls = 0;
+	const { PaginationProgressError } = require('../dist/nodes/JiraPollTrigger/poll-state');
 	await assert.rejects(
 		collect(
 			new JiraTransport(async () => ({
 				issues: [issue('1')],
 				isLast: false,
-				nextPageToken: String(++calls),
+				nextPageToken: 'same-token',
 			})).searchIssues('', 0, []),
 		),
-		/repeated/,
+		(error) => error instanceof PaginationProgressError,
 	);
 	calls = 0;
 	await assert.rejects(
@@ -567,12 +580,16 @@ test('the deadline caps every timeout, refuses a request once passed, and stops 
 				{ now: () => 0, deadline: 4_000, sleep: async (ms) => sleeps.push(ms) },
 			).searchIssues('', 0, []),
 		),
-		(error) => error.name === 'Error' && error.status === 429,
+		(error) =>
+			error instanceof PollBudgetExhausted &&
+			error.failure?.status === 429 &&
+			/HTTP 429/.test(error.reason),
 	);
 	assert.equal(attempts, 1);
 	assert.deepEqual(sleeps, []);
 });
-test('a retry wait that runs past the deadline retains the preceding HTTP failure', async () => {
+test('a retry wait that runs past the deadline hands off with the preceding HTTP failure', async () => {
+	const { PollBudgetExhausted } = require('../dist/nodes/JiraPollTrigger/poll-state');
 	let clock = 0;
 	let calls = 0;
 	await assert.rejects(
@@ -591,7 +608,10 @@ test('a retry wait that runs past the deadline retains the preceding HTTP failur
 				},
 			).searchIssues('', 0, []),
 		),
-		(error) => error.status === 429,
+		(error) =>
+			error instanceof PollBudgetExhausted &&
+			error.failure?.status === 429 &&
+			/HTTP 429/.test(error.reason),
 	);
 	assert.equal(calls, 1);
 });
@@ -611,7 +631,12 @@ test('a timeout on the final retry at the deadline is a budget stop, but a 401 i
 				{ now: () => clock, deadline: 10_000, maxRetries: 0, sleep: async () => {} },
 			).searchIssues('', 0, []),
 		),
-		PollBudgetExhausted,
+		(error) => {
+			assert(error instanceof PollBudgetExhausted);
+			assert.equal(error.failure?.timedOut, true);
+			assert.equal(error.failure?.code, 'ECONNABORTED');
+			return true;
+		},
 	);
 	assert.equal(attempts, 1);
 	await assert.rejects(

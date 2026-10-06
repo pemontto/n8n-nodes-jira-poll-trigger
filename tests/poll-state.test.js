@@ -5,6 +5,7 @@ const {
 	PollBudgetExhausted,
 	MAX_DEDUP_KEYS,
 	JiraReadError,
+	PaginationProgressError,
 } = require('../dist/nodes/JiraPollTrigger/poll-state.js');
 const iso = (n) => new Date(n).toISOString();
 const config = {
@@ -305,7 +306,7 @@ test('recent keys evict oldest entries with one warning and keep reading', async
 	assert.deepEqual(previous, original);
 });
 
-test('real Jira failures after progress always throw with status and leave saved state untouched', async () => {
+test('Jira failures outside budget stops throw with status and leave saved state untouched', async () => {
 	for (const status of [401, 403, 404, 429, 503]) {
 		const previous = state();
 		const original = structuredClone(previous);
@@ -317,9 +318,7 @@ test('real Jira failures after progress always throw with status and leave saved
 				source: {
 					async *issues() {
 						yield issue;
-						throw new JiraReadError(`Jira read failed (HTTP ${status})`, status, {
-							transient: status >= 429,
-						});
+						throw new JiraReadError(`Jira read failed (HTTP ${status})`, status);
 					},
 					async *comments() {},
 				},
@@ -328,6 +327,76 @@ test('real Jira failures after progress always throw with status and leave saved
 		);
 		assert.deepEqual(previous, original);
 	}
+});
+
+test('a deadline failure after issue progress returns the prefix and retains its HTTP failure', async () => {
+	const failure = new JiraReadError('Jira read failed (HTTP 429)', 429);
+	const result = await scanPoll({
+		config: { ...config, resource: 'issue', site: 'example.atlassian.net' },
+		state: state(),
+		pollStart: 1300,
+		source: {
+			async *issues() {
+				yield issue;
+				throw new PollBudgetExhausted('deadline', failure);
+			},
+			async *comments() {},
+		},
+	});
+	assert.deepEqual(
+		result.events.map((event) => event.eventType),
+		['issue.created', 'issue.updated'],
+	);
+	assert.equal(result.stopped, 'deadline');
+	assert.equal(result.state.checkpoint, 1000);
+	assert.deepEqual(result.state.window.afterIds, ['1']);
+});
+
+test('a deadline failure before progress keeps its status in the no-progress error', async () => {
+	const failure = new JiraReadError('Jira read failed (HTTP 429)', 429);
+	await assert.rejects(
+		scanPoll({
+			config: { ...config, resource: 'issue', site: 'example.atlassian.net' },
+			state: state(),
+			pollStart: 1300,
+			source: {
+				async *issues() {
+					throw new PollBudgetExhausted('deadline', failure);
+				},
+				async *comments() {},
+			},
+		}),
+		(error) => {
+			assert(error instanceof JiraReadError);
+			assert.equal(error.status, 429);
+			assert.match(error.message, /made no progress/);
+			return true;
+		},
+	);
+});
+
+test('positioned pagination errors describe the failure without claiming no progress', async () => {
+	await assert.rejects(
+		scanPoll({
+			config: { ...config, resource: 'issue', site: 'example.atlassian.net' },
+			state: {
+				...state(),
+				window: { since: 1000, until: 1200, afterCreated: 1100, afterIds: ['1'] },
+			},
+			pollStart: 1300,
+			source: {
+				async *issues() {
+					throw new PaginationProgressError('repeated token');
+				},
+				async *comments() {},
+			},
+		}),
+		(error) => {
+			assert.match(error.message, /failed at checkpoint 1000/);
+			assert.doesNotMatch(error.message, /made no progress/);
+			return true;
+		},
+	);
 });
 
 test('a deadline hands over exact milliseconds and handled IDs, then resumes timestamp ties', async () => {
@@ -452,13 +521,6 @@ test('stale polls and corrupt state fail explicitly', async () => {
 	await assert.rejects(poll([], { state: { ...state(), seen: null } }), /Invalid saved/);
 });
 
-test('invalid resource and event values fail before activation', async () => {
-	for (const bad of [{ resource: 'other' }, { event: 'deleted' }])
-		await assert.rejects(
-			poll([], { state: undefined, config: { ...config, ...bad } }),
-			/Invalid Jira polling resource or event/,
-		);
-});
 test('an old backlog completes after cache eviction and expires keys by the overlap', async () => {
 	const result = await poll([], {
 		pollStart: 10000,
