@@ -29,11 +29,12 @@ Jira Cloud only. Tested with n8n 2.38.1.
 - Several edits between polls produce one update event with the latest state.
 - JQL matches the current state, so `status = Open` misses the change that moves an issue out of Open.
 - Deletions do not produce events.
-- Activation, and any change to the JQL, resource, event or credential, starts from that moment. Earlier changes are not replayed.
+- On first activation, polling starts from that moment. Reactivating with unchanged settings resumes from the last saved position. Changing the JQL, Jira site, resource, event or credential starts from now; earlier changes are not replayed.
 - Rendered HTML output (the default) is untrusted. Display it only where untrusted HTML is handled safely.
-- Every output includes top-level `eventId`, `eventType` and `eventTime`. Use `eventId` for downstream deduplication; rare repeats can follow a crash, restore, overlapping polls across processes, or sustained overload.
-- The recent deduplication cache holds 40,000 events. Its oldest keys are evicted with a warning; cursor IDs are retained separately. Prefer an idempotent destination, and review the [recovery and duplicate limits](docs/how-it-works.md#duplicates-and-practical-limits) for downstream retention guidance.
-- A poll stopped by its time budget or page cap emits its completed prefix and resumes the same window. Jira API failures remain errors with their status and do not commit partial progress.
+- Every output includes `eventId`, `eventType` and `eventTime`. Use `eventId` as the destination's idempotency key, or upsert records by `eventId`, so a repeated event does not create a duplicate.
+- For downstream deduplication in n8n, see [Remove Duplicates setup and recovery limits](docs/how-it-works.md#duplicates-and-practical-limits). Its history can fill and stop the workflow unless you allow generous capacity and schedule regular history clearing.
+- With `N8N_SCHEDULER_ENABLED` and `N8N_SCHEDULER_POLL_TRIGGERS_ENABLED` on and `N8N_POLLER_DURABLE_CURSORS_ENABLED` off (its default), n8n saves progress only when a poll emits events. Multi-main durable scheduler setups and restarts may miss changes between activation and the first scheduled poll.
+- A poll interrupted by its time limit or page limit continues on a later poll. See [polling and recovery](docs/how-it-works.md#position-and-recovery) for how interruptions and Jira errors affect progress.
 
 [How it works](https://github.com/pemontto/n8n-nodes-jira-poll-trigger/blob/main/docs/how-it-works.md) covers the polling window, duplicates and recovery after an outage.
 
@@ -41,4 +42,4 @@ Jira Cloud only. Tested with n8n 2.38.1.
 
 ### 0.1.0 (unreleased)
 
-Unreleased.
+First release. Poll Jira Cloud issues and comments on a schedule, with configurable JQL, event types, comment visibility, fields and output format. Events include stable identifiers for downstream idempotence. Polling resumes after an interruption, and transient Jira errors are retried.
