@@ -31,11 +31,14 @@ Jira Cloud only. Tested with n8n 2.38.1.
 - Deletions do not produce events.
 - Activation, and any change to the JQL, resource, event or credential, starts from that moment. Earlier changes are not replayed.
 - Rendered HTML output (the default) is untrusted. Display it only where untrusted HTML is handled safely.
+- Every output includes top-level `eventId`, `eventType` and `eventTime`. Use `eventId` for downstream deduplication; rare repeats can follow a crash, restore, overlapping polls across processes, or sustained overload.
+- The recent deduplication cache holds 40,000 events. Its oldest keys are evicted with a warning; cursor IDs are retained separately. Prefer an idempotent destination, and review the [recovery and duplicate limits](docs/how-it-works.md#duplicates-and-practical-limits) for downstream retention guidance.
+- A poll stopped by its time budget or page cap emits its completed prefix and resumes the same window. Jira API failures remain errors with their status and do not commit partial progress.
 
 [How it works](https://github.com/pemontto/n8n-nodes-jira-poll-trigger/blob/main/docs/how-it-works.md) covers the polling window, duplicates and recovery after an outage.
 
 ## Version history
 
-### 0.1.0
+### 0.1.0 (unreleased)
 
-First release.
+Unreleased.
